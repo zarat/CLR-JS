@@ -10,10 +10,12 @@
 // - overload resolution supports optional params + params (ParamArray)
 // - hidden/ambiguous members resolved to most-derived declaration (fixes TableLayoutPanel.Controls ambiguity)
 // - concurrency:
-//    * task <expr>            -> starts on ThreadPool, RETURNS handle (JsTask)
-//    * await <expr> / join <expr> -> waits; returns result for JsTask or Task<T>
-//    * yield;                 -> Thread.Sleep(1)
-//    * lock(expr) stmt        -> Monitor lock (string => named lock)
+//    * task <expr>                 -> starts on ThreadPool, RETURNS handle (JsTask) when used as expression
+//    * task { ... }                -> starts block in background, RETURNS handle (JsTask) when used as expression
+//    * task <expr>; / task {..};   -> fire-and-forget statement
+//    * await <expr> / join <expr>  -> waits; returns result for JsTask or Task<T>
+//    * yield;                      -> Thread.Sleep(1)
+//    * lock(expr) stmt             -> Monitor lock (string => named lock)
 
 using System;
 using System.IO;
@@ -37,39 +39,35 @@ namespace MiniJs
     {
         EOF_TOK,
 
-        // literals/ident
         IDENT, NUMBER, STRING,
         TRUE_TOK, FALSE_TOK, NULL_TOK,
 
-        // keywords
         LET, VAR, FUNCTION, CLASS, NEW, THIS, RETURN, IF, ELSE,
         WHILE, FOR, FOREACH, IN, BREAK, CONTINUE,
         IMPORT, AS,
         TASK, YIELD, LOCK,
         AWAIT, JOIN,
 
-        // punctuation
         LPAREN, RPAREN,
         LBRACE, RBRACE,
         LBRACK, RBRACK,
         COMMA, SEMI, DOT, COLON,
 
-        // operators
-        ASSIGN, // =
+        ASSIGN,
         PLUS_ASSIGN, MINUS_ASSIGN, MUL_ASSIGN, DIV_ASSIGN, MOD_ASSIGN,
 
         EQ, NEQ, LT, GT, LEQ, GEQ,
 
         PLUS, MINUS, MUL, DIV, MOD,
-        POW,           // **
+        POW,
 
         BITAND, BITXOR, BITOR,
         AND, OR,
 
-        INC, DEC,      // ++ --
+        INC, DEC,
 
-        BITNOT,        // ~
-        BANG           // !
+        BITNOT,
+        BANG
     }
 
     static class Tok
@@ -181,14 +179,12 @@ namespace MiniJs
                 char c = Cur;
                 if (c is ' ' or '\t' or '\r' or '\n') { Advance(); continue; }
 
-                // // comment
                 if (c == '/' && Peek() == '/')
                 {
                     while (!AtEnd && Cur != '\n') Advance();
                     continue;
                 }
 
-                // /* comment */
                 if (c == '/' && Peek() == '*')
                 {
                     Advance(); Advance();
@@ -213,7 +209,6 @@ namespace MiniJs
 
             char c = Cur;
 
-            // identifiers / keywords
             if (IsIdentStart(c))
             {
                 var sb = new StringBuilder();
@@ -251,7 +246,6 @@ namespace MiniJs
                 };
             }
 
-            // numbers
             if (char.IsDigit(c))
             {
                 var sb = new StringBuilder();
@@ -264,7 +258,6 @@ namespace MiniJs
                 return new Token(TokType.NUMBER, sb.ToString(), pos);
             }
 
-            // strings "..."
             if (c == '"')
             {
                 Advance();
@@ -296,7 +289,6 @@ namespace MiniJs
                 return new Token(TokType.STRING, sb.ToString(), pos);
             }
 
-            // multi-char ops (order matters)
             if (c == '*' && Peek() == '*') { Advance(); Advance(); return new Token(TokType.POW, "**", pos); }
             if (c == '+' && Peek() == '+') { Advance(); Advance(); return new Token(TokType.INC, "++", pos); }
             if (c == '-' && Peek() == '-') { Advance(); Advance(); return new Token(TokType.DEC, "--", pos); }
@@ -314,7 +306,6 @@ namespace MiniJs
             if (c == '&' && Peek() == '&') { Advance(); Advance(); return new Token(TokType.AND, "&&", pos); }
             if (c == '|' && Peek() == '|') { Advance(); Advance(); return new Token(TokType.OR, "||", pos); }
 
-            // single-char
             Token One(TokType tp, string lex) { Advance(); return new Token(tp, lex, pos); }
 
             return c switch
@@ -373,14 +364,16 @@ namespace MiniJs
         Member, Index, Call, NewExpr,
 
         TaskExpr,
-        AwaitExpr
+        AwaitExpr,
+
+        TaskBlock // <-- NEW: task { ... } as expression block
     }
 
     sealed class Node
     {
         public NodeType Type;
         public Token Tok;
-        public string Text = ""; // used for NewExpr/ImportStmt: full dotted name
+        public string Text = "";
         public List<Node?> Kids = new();
 
         public Node(NodeType t) { Type = t; Tok = default; }
@@ -421,7 +414,7 @@ namespace MiniJs
         private Node Statement()
         {
             if (_cur.Type == TokType.IMPORT) return ImportStmt();
-            if (_cur.Type == TokType.TASK) return TaskStmt();
+            if (_cur.Type == TokType.TASK) return TaskStmt();       // statement task ...
             if (_cur.Type == TokType.YIELD) return YieldStmt();
             if (_cur.Type == TokType.LOCK) return LockStmt();
             if (_cur.Type == TokType.AWAIT || _cur.Type == TokType.JOIN) return AwaitStmt();
@@ -445,10 +438,34 @@ namespace MiniJs
             return s;
         }
 
+        // NEW: parse a statement-list block for task { ... } expression
+        private Node TaskBlockExpr(Token taskTok)
+        {
+            Consume(TokType.LBRACE, "'{' after task");
+            var b = new Node(NodeType.TaskBlock, taskTok);
+            while (_cur.Type != TokType.RBRACE && _cur.Type != TokType.EOF_TOK)
+                b.Kids.Add(Statement());
+            Consume(TokType.RBRACE, "'}' after task block");
+            return b;
+        }
+
         private Node TaskStmt()
         {
             Token tt = Consume(TokType.TASK, "'task'");
-            var expr = Expression();
+
+            // statement form:
+            //   task { ... };
+            //   task doWork(123);
+            Node expr;
+            if (_cur.Type == TokType.LBRACE)
+            {
+                expr = TaskBlockExpr(tt);
+            }
+            else
+            {
+                expr = Expression();
+            }
+
             Match(TokType.SEMI);
             var n = new Node(NodeType.TaskStmt, tt);
             n.Kids.Add(expr);
@@ -629,10 +646,7 @@ namespace MiniJs
             Consume(TokType.LPAREN, "'('");
 
             Node? init = null;
-            if (_cur.Type == TokType.SEMI)
-            {
-                Consume(TokType.SEMI, "';'");
-            }
+            if (_cur.Type == TokType.SEMI) Consume(TokType.SEMI, "';'");
             else
             {
                 init = (_cur.Type == TokType.LET || _cur.Type == TokType.VAR) ? LetDecl(withSemi: false) : Expression();
@@ -640,10 +654,7 @@ namespace MiniJs
             }
 
             Node? cond = null;
-            if (_cur.Type == TokType.SEMI)
-            {
-                Consume(TokType.SEMI, "';'");
-            }
+            if (_cur.Type == TokType.SEMI) Consume(TokType.SEMI, "';'");
             else
             {
                 cond = Expression();
@@ -651,10 +662,7 @@ namespace MiniJs
             }
 
             Node? post = null;
-            if (_cur.Type == TokType.RPAREN)
-            {
-                Consume(TokType.RPAREN, "')'");
-            }
+            if (_cur.Type == TokType.RPAREN) Consume(TokType.RPAREN, "')'");
             else
             {
                 post = Expression();
@@ -915,16 +923,25 @@ namespace MiniJs
 
         private Node Unary()
         {
-            // task expr  (as expression)
+            // NEW: task as expression:
+            //   task expr
+            //   task { ... }
             if (_cur.Type == TokType.TASK)
             {
                 Token tt = Consume(TokType.TASK, "'task'");
                 var u = new Node(NodeType.TaskExpr, tt);
-                u.Kids.Add(Unary());
+
+                if (_cur.Type == TokType.LBRACE)
+                {
+                    u.Kids.Add(TaskBlockExpr(tt));
+                }
+                else
+                {
+                    u.Kids.Add(Unary());
+                }
                 return u;
             }
 
-            // await/join expr (as expression)
             if (_cur.Type == TokType.AWAIT || _cur.Type == TokType.JOIN)
             {
                 Token at = _cur;
@@ -943,6 +960,7 @@ namespace MiniJs
                 u.Kids.Add(Unary());
                 return u;
             }
+
             return Postfix();
         }
 
@@ -1033,7 +1051,6 @@ namespace MiniJs
                 return e;
             }
 
-            // new TypeName(...)
             if (Match(TokType.NEW))
             {
                 Token first = Consume(TokType.IDENT, "type name after new");
@@ -1059,7 +1076,6 @@ namespace MiniJs
                 return n;
             }
 
-            // array literal
             if (Match(TokType.LBRACK))
             {
                 var arr = new Node(NodeType.ArrayLit, new Token(TokType.LBRACK, "[", _cur.Pos));
@@ -1076,7 +1092,6 @@ namespace MiniJs
                 return arr;
             }
 
-            // object literal
             if (Match(TokType.LBRACE))
             {
                 var obj = new Node(NodeType.ObjectLit, new Token(TokType.LBRACE, "{", _cur.Pos));
@@ -1107,7 +1122,6 @@ namespace MiniJs
                 return obj;
             }
 
-            // function expression
             if (_cur.Type == TokType.FUNCTION)
             {
                 Token ftok = Consume(TokType.FUNCTION, "'function'");
@@ -1173,9 +1187,7 @@ namespace MiniJs
             {
                 if (Vars.ContainsKey(k)) { Vars[k] = v; return; }
             }
-
             if (Parent != null) { Parent.Set(k, v); return; }
-
             lock (_lock) Vars[k] = v;
         }
 
@@ -1310,7 +1322,6 @@ namespace MiniJs
         }
     }
 
-    // Task handle exposed to scripts (CLR object => properties/methods accessible)
     sealed class JsTask
     {
         private readonly Task<object?> _task;
@@ -1322,10 +1333,8 @@ namespace MiniJs
         public bool IsFaulted => _task.IsFaulted;
         public string Status => _task.Status.ToString();
 
-        // Non-blocking: null if not completed successfully
         public object? Result => (_task.IsCompletedSuccessfully) ? _task.Result : null;
 
-        // Blocking wait (returns Result if success)
         public object? Wait()
         {
             return _task.GetAwaiter().GetResult();
@@ -1356,7 +1365,6 @@ namespace MiniJs
 
         private readonly Dictionary<EventKey, List<Delegate>> _eventSubs = new(new EventKeyComparer());
 
-        // named locks for lock("name") { ... }
         private readonly object _namedLocksGuard = new();
         private readonly Dictionary<string, object> _namedLocks = new(StringComparer.Ordinal);
 
@@ -1417,22 +1425,8 @@ namespace MiniJs
         {
             if (a is null && b is null) return true;
             if (a is null || b is null) return false;
-
             if (a.GetType() != b.GetType()) return false;
-
-            return a switch
-            {
-                double da when b is double db => da == db,
-                bool ba when b is bool bb => ba == bb,
-                string sa when b is string sb => sa == sb,
-                JsObject oa when b is JsObject ob => ReferenceEquals(oa, ob),
-                JsArray aa when b is JsArray ab => ReferenceEquals(aa, ab),
-                Function fa when b is Function fb => ReferenceEquals(fa, fb),
-                ClassDef ca when b is ClassDef cb => ReferenceEquals(ca, cb),
-                Type ta when b is Type tb => ReferenceEquals(ta, tb),
-                JsTask ta2 when b is JsTask tb2 => ReferenceEquals(ta2, tb2),
-                _ => a.Equals(b)
-            };
+            return a.Equals(b);
         }
 
         // ---------------- CLR helpers ----------------
@@ -1759,7 +1753,6 @@ namespace MiniJs
                 .Where(p => p.Name == name && p.GetIndexParameters().Length == 0)
                 .ToArray();
             if (props.Length == 0) return null;
-
             return props.OrderBy(p => InheritanceDistance(t, p.DeclaringType)).First();
         }
 
@@ -1767,7 +1760,6 @@ namespace MiniJs
         {
             var fields = t.GetFields(flags).Where(f => f.Name == name).ToArray();
             if (fields.Length == 0) return null;
-
             return fields.OrderBy(f => InheritanceDistance(t, f.DeclaringType)).First();
         }
 
@@ -1775,7 +1767,6 @@ namespace MiniJs
         {
             var evs = t.GetEvents(flags).Where(e => e.Name == name).ToArray();
             if (evs.Length == 0) return null;
-
             return evs.OrderBy(e => InheritanceDistance(t, e.DeclaringType)).First();
         }
 
@@ -1827,8 +1818,7 @@ namespace MiniJs
         {
             var list = new List<object?>(args.Length);
             for (int i = 0; i < args.Length; i++) list.Add(args[i]);
-
-            object? thisVal = args.Length > 0 ? args[0] : null; // sender
+            object? thisVal = args.Length > 0 ? args[0] : null;
             return CallFunction(fn, list, thisVal);
         }
 
@@ -2047,7 +2037,7 @@ namespace MiniJs
             {
                 if (args.Count != 0)
                     throw new Exception($"TypeError: cannot construct static class '{t.FullName}' with arguments");
-                return t; // static class as Type-handle
+                return t;
             }
 
             if (t.IsAbstract || t.IsInterface)
@@ -2092,10 +2082,9 @@ namespace MiniJs
 
         private JsTask StartTask(Node expr, Env env)
         {
-            // Evaluate expression in background thread, return result
             var t = Task.Run(() =>
             {
-                // Let exceptions propagate to await/join
+                // note: ReturnSignal inside task-block is handled in Eval(NodeType.TaskBlock)
                 return Eval(expr, env);
             });
 
@@ -2111,7 +2100,6 @@ namespace MiniJs
 
             if (v is Task t)
             {
-                // Task<T>?
                 var tt = t.GetType();
                 if (tt.IsGenericType && tt.GetGenericTypeDefinition() == typeof(Task<>))
                 {
@@ -2124,7 +2112,6 @@ namespace MiniJs
                 return null;
             }
 
-            // also allow delegates returning Task / JsTask (convenient)
             if (v is Delegate d)
             {
                 var rv = d.DynamicInvoke();
@@ -2277,6 +2264,22 @@ namespace MiniJs
                         return last;
                     }
 
+                // NEW: task { ... } evaluation (captures return)
+                case NodeType.TaskBlock:
+                    {
+                        var benv = new Env(env);
+                        object? last = null;
+                        try
+                        {
+                            foreach (var s in n.Kids) last = Exec(s!, benv);
+                            return last;
+                        }
+                        catch (ReturnSignal rs)
+                        {
+                            return rs.Value;
+                        }
+                    }
+
                 case NodeType.Literal:
                     {
                         if (n.Tok.Type == TokType.NUMBER) return double.Parse(n.Tok.Lexeme, CultureInfo.InvariantCulture);
@@ -2322,7 +2325,7 @@ namespace MiniJs
 
                 case NodeType.TaskExpr:
                     {
-                        // task <expr>  (expr evaluated inside the task)
+                        // task <expr> OR task { ... }
                         return StartTask(n.Kids[0]!, env);
                     }
 
@@ -2615,7 +2618,8 @@ namespace MiniJs
 
                 case NodeType.TaskStmt:
                     {
-                        _ = StartTask(n.Kids[0]!, env); // fire-and-forget
+                        // fire-and-forget
+                        _ = StartTask(n.Kids[0]!, env);
                         return null;
                     }
 
@@ -2640,14 +2644,8 @@ namespace MiniJs
                         object lkObj = GetLockObject(lkVal);
 
                         Monitor.Enter(lkObj);
-                        try
-                        {
-                            return Exec(body, env);
-                        }
-                        finally
-                        {
-                            Monitor.Exit(lkObj);
-                        }
+                        try { return Exec(body, env); }
+                        finally { Monitor.Exit(lkObj); }
                     }
 
                 case NodeType.LetDecl:
@@ -2870,7 +2868,6 @@ namespace MiniJs
         {
             try
             {
-                // WinForms init (optional but nice)
                 try
                 {
                     Application.EnableVisualStyles();
@@ -2878,9 +2875,7 @@ namespace MiniJs
                 }
                 catch { }
 
-                string code = args.Length >= 1
-                    ? ReadFile(args[0])
-                    : "print(\"MiniJs ready\");\n";
+                string code = args.Length >= 1 ? ReadFile(args[0]) : "print(\"MiniJs ready\");\n";
 
                 var lx = new Lexer(code);
                 var ps = new Parser(lx);
