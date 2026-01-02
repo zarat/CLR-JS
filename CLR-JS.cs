@@ -10,12 +10,17 @@
 // - overload resolution supports optional params + params (ParamArray)
 // - hidden/ambiguous members resolved to most-derived declaration (fixes TableLayoutPanel.Controls ambiguity)
 // - concurrency:
-//    * task <expr>                 -> starts on ThreadPool, RETURNS handle (JsTask) when used as expression
-//    * task { ... }                -> starts block in background, RETURNS handle (JsTask) when used as expression
+//    * task <expr>                 -> starts via queue/limit; RETURNS handle (JsTask) when used as expression
+//    * task { ... }                -> starts block in background; RETURNS handle (JsTask) when used as expression
 //    * task <expr>; / task {..};   -> fire-and-forget statement
 //    * await <expr> / join <expr>  -> waits; returns result for JsTask or Task<T>
 //    * yield;                      -> Thread.Sleep(1)
 //    * lock(expr) stmt             -> Monitor lock (string => named lock)
+//
+// Builtins (task control):
+//    setTaskLimit(n)
+//    setTaskQueueLimit(n)
+//    taskStats() -> { MaxConcurrency: n, QueueLimit: m, Queued: q }
 
 using System;
 using System.IO;
@@ -30,7 +35,6 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 
-// for WinForms projects (net*-windows + <UseWindowsForms>true</UseWindowsForms>)
 using System.Windows.Forms;
 
 namespace MiniJs
@@ -366,7 +370,7 @@ namespace MiniJs
         TaskExpr,
         AwaitExpr,
 
-        TaskBlock // <-- NEW: task { ... } as expression block
+        TaskBlock
     }
 
     sealed class Node
@@ -414,7 +418,7 @@ namespace MiniJs
         private Node Statement()
         {
             if (_cur.Type == TokType.IMPORT) return ImportStmt();
-            if (_cur.Type == TokType.TASK) return TaskStmt();       // statement task ...
+            if (_cur.Type == TokType.TASK) return TaskStmt();
             if (_cur.Type == TokType.YIELD) return YieldStmt();
             if (_cur.Type == TokType.LOCK) return LockStmt();
             if (_cur.Type == TokType.AWAIT || _cur.Type == TokType.JOIN) return AwaitStmt();
@@ -438,7 +442,6 @@ namespace MiniJs
             return s;
         }
 
-        // NEW: parse a statement-list block for task { ... } expression
         private Node TaskBlockExpr(Token taskTok)
         {
             Consume(TokType.LBRACE, "'{' after task");
@@ -453,18 +456,9 @@ namespace MiniJs
         {
             Token tt = Consume(TokType.TASK, "'task'");
 
-            // statement form:
-            //   task { ... };
-            //   task doWork(123);
             Node expr;
-            if (_cur.Type == TokType.LBRACE)
-            {
-                expr = TaskBlockExpr(tt);
-            }
-            else
-            {
-                expr = Expression();
-            }
+            if (_cur.Type == TokType.LBRACE) expr = TaskBlockExpr(tt);
+            else expr = Expression();
 
             Match(TokType.SEMI);
             var n = new Node(NodeType.TaskStmt, tt);
@@ -923,22 +917,14 @@ namespace MiniJs
 
         private Node Unary()
         {
-            // NEW: task as expression:
-            //   task expr
-            //   task { ... }
             if (_cur.Type == TokType.TASK)
             {
                 Token tt = Consume(TokType.TASK, "'task'");
                 var u = new Node(NodeType.TaskExpr, tt);
 
-                if (_cur.Type == TokType.LBRACE)
-                {
-                    u.Kids.Add(TaskBlockExpr(tt));
-                }
-                else
-                {
-                    u.Kids.Add(Unary());
-                }
+                if (_cur.Type == TokType.LBRACE) u.Kids.Add(TaskBlockExpr(tt));
+                else u.Kids.Add(Unary());
+
                 return u;
             }
 
@@ -1152,7 +1138,77 @@ namespace MiniJs
         }
     }
 
-    // --- runtime objects ---
+    // ---------------- Task Manager (queue + limit) ----------------
+
+    sealed class TaskManager
+    {
+        private readonly object _cfgLock = new();
+
+        private SemaphoreSlim _sem;
+        private int _maxConcurrency;
+        private int _queueLimit;
+        private int _queued; // pending + running
+
+        public TaskManager(int maxConcurrency, int queueLimit)
+        {
+            _maxConcurrency = Math.Max(1, maxConcurrency);
+            _queueLimit = Math.Max(1, queueLimit);
+            _sem = new SemaphoreSlim(_maxConcurrency, _maxConcurrency);
+        }
+
+        public int MaxConcurrency { get { lock (_cfgLock) return _maxConcurrency; } }
+        public int QueueLimit { get { lock (_cfgLock) return _queueLimit; } }
+        public int Queued => Volatile.Read(ref _queued);
+
+        public void SetMaxConcurrency(int n)
+        {
+            n = Math.Max(1, n);
+            lock (_cfgLock)
+            {
+                if (n == _maxConcurrency) return;
+
+                // Replace semaphore for future tasks; existing waits continue on old instance
+                _maxConcurrency = n;
+                _sem = new SemaphoreSlim(_maxConcurrency, _maxConcurrency);
+            }
+        }
+
+        public void SetQueueLimit(int n)
+        {
+            n = Math.Max(1, n);
+            lock (_cfgLock) _queueLimit = n;
+        }
+
+        public Task<object?> Enqueue(Func<object?> work)
+        {
+            int q = Interlocked.Increment(ref _queued);
+            int limit = QueueLimit;
+            if (q > limit)
+            {
+                Interlocked.Decrement(ref _queued);
+                throw new Exception($"Task queue overflow (limit={limit})");
+            }
+
+            SemaphoreSlim sem;
+            lock (_cfgLock) sem = _sem;
+
+            return Task.Run(async () =>
+            {
+                await sem.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    return work();
+                }
+                finally
+                {
+                    sem.Release();
+                    Interlocked.Decrement(ref _queued);
+                }
+            });
+        }
+    }
+
+    // ---------------- runtime objects ----------------
 
     sealed class JsArray { public List<object?> Items = new(); }
 
@@ -1335,10 +1391,7 @@ namespace MiniJs
 
         public object? Result => (_task.IsCompletedSuccessfully) ? _task.Result : null;
 
-        public object? Wait()
-        {
-            return _task.GetAwaiter().GetResult();
-        }
+        public object? Wait() => _task.GetAwaiter().GetResult();
 
         internal Task<object?> Task => _task;
     }
@@ -1368,9 +1421,17 @@ namespace MiniJs
         private readonly object _namedLocksGuard = new();
         private readonly Dictionary<string, object> _namedLocks = new(StringComparer.Ordinal);
 
+        private readonly TaskManager _taskMgr;
+
         public Interpreter()
         {
             Global = new Env();
+
+            // default: CPU-count parallel, queue cap 5000
+            _taskMgr = new TaskManager(
+                maxConcurrency: Math.Max(1, Environment.ProcessorCount),
+                queueLimit: 5000
+            );
 
             var pf = new Function
             {
@@ -1389,6 +1450,50 @@ namespace MiniJs
             Global.Declare("print", pf);
 
             Global.Declare("System", new ClrNamespace("System"));
+
+            // task control builtins
+            Global.Declare("setTaskLimit", new Function
+            {
+                IsNative = true,
+                Native = (args, _) =>
+                {
+                    int n = args.Count > 0 ? (int)Rt.ToNumber(args[0]) : Environment.ProcessorCount;
+                    _taskMgr.SetMaxConcurrency(n);
+                    return null;
+                }
+            });
+
+            Global.Declare("setTaskQueueLimit", new Function
+            {
+                IsNative = true,
+                Native = (args, _) =>
+                {
+                    int n = args.Count > 0 ? (int)Rt.ToNumber(args[0]) : 5000;
+                    _taskMgr.SetQueueLimit(n);
+                    return null;
+                }
+            });
+
+            Global.Declare("taskStats", new Function
+            {
+                IsNative = true,
+                Native = (_, __) =>
+                {
+                    var o = new JsObject();
+                    lock (o)
+                    {
+                        o.Order.Add("MaxConcurrency");
+                        o.Props["MaxConcurrency"] = (double)_taskMgr.MaxConcurrency;
+
+                        o.Order.Add("QueueLimit");
+                        o.Props["QueueLimit"] = (double)_taskMgr.QueueLimit;
+
+                        o.Order.Add("Queued");
+                        o.Props["Queued"] = (double)_taskMgr.Queued;
+                    }
+                    return o;
+                }
+            });
         }
 
         public object? CallFunction(Function fn, List<object?> args, object? thisVal)
@@ -1732,8 +1837,6 @@ namespace MiniJs
             return best;
         }
 
-        // ---------- AmbiguousMatch fix: pick most-derived hidden member ----------
-
         private static int InheritanceDistance(Type start, Type? declaring)
         {
             int d = 0;
@@ -1811,8 +1914,6 @@ namespace MiniJs
 
             return null;
         }
-
-        // ---------- Events: obj.Event = function(...) { ... } ----------
 
         private object? InvokeScriptForEvent(Function fn, object?[] args)
         {
@@ -2033,6 +2134,7 @@ namespace MiniJs
 
         private static object CreateClrInstance(Type t, List<object?> args)
         {
+            // static class => give back the Type (so you can use it as "System.IO.File.ReadAllText(...)")
             if (t.IsAbstract && t.IsSealed)
             {
                 if (args.Count != 0)
@@ -2082,13 +2184,8 @@ namespace MiniJs
 
         private JsTask StartTask(Node expr, Env env)
         {
-            var t = Task.Run(() =>
-            {
-                // note: ReturnSignal inside task-block is handled in Eval(NodeType.TaskBlock)
-                return Eval(expr, env);
-            });
-
-            return new JsTask(t);
+            var task = _taskMgr.Enqueue(() => Eval(expr, env));
+            return new JsTask(task);
         }
 
         private static object? AwaitAny(object? v)
@@ -2264,7 +2361,6 @@ namespace MiniJs
                         return last;
                     }
 
-                // NEW: task { ... } evaluation (captures return)
                 case NodeType.TaskBlock:
                     {
                         var benv = new Env(env);
@@ -2324,10 +2420,7 @@ namespace MiniJs
                     }
 
                 case NodeType.TaskExpr:
-                    {
-                        // task <expr> OR task { ... }
-                        return StartTask(n.Kids[0]!, env);
-                    }
+                    return StartTask(n.Kids[0]!, env);
 
                 case NodeType.AwaitExpr:
                     {
@@ -2491,14 +2584,9 @@ namespace MiniJs
                         var args = new List<object?>();
                         foreach (var a in argsNode.Kids) args.Add(Eval(a!, env));
 
-                        if (fnv is Function fn)
-                            return CallFunction(fn, args, thisVal);
-
-                        if (fnv is ClrCallable cc)
-                            return InvokeClrCallable(cc, args);
-
-                        if (fnv is Delegate del)
-                            return del.DynamicInvoke(args.ToArray());
+                        if (fnv is Function fn) return CallFunction(fn, args, thisVal);
+                        if (fnv is ClrCallable cc) return InvokeClrCallable(cc, args);
+                        if (fnv is Delegate del) return del.DynamicInvoke(args.ToArray());
 
                         throw new Exception("TypeError: call of non-function");
                     }
@@ -2618,7 +2706,6 @@ namespace MiniJs
 
                 case NodeType.TaskStmt:
                     {
-                        // fire-and-forget
                         _ = StartTask(n.Kids[0]!, env);
                         return null;
                     }
