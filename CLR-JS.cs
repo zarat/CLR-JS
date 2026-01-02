@@ -10,13 +10,10 @@
 // - overload resolution supports optional params + params (ParamArray)
 // - hidden/ambiguous members resolved to most-derived declaration (fixes TableLayoutPanel.Controls ambiguity)
 // - concurrency:
-//    * task <expr>;      -> runs expression on ThreadPool (fire-and-forget)
-//    * yield;            -> Thread.Sleep(1)
-//    * lock(expr) stmt   -> Monitor lock (string => named lock)
-//
-// Build (WinForms):
-//   <TargetFramework>net8.0-windows</TargetFramework>
-//   <UseWindowsForms>true</UseWindowsForms>
+//    * task <expr>            -> starts on ThreadPool, RETURNS handle (JsTask)
+//    * await <expr> / join <expr> -> waits; returns result for JsTask or Task<T>
+//    * yield;                 -> Thread.Sleep(1)
+//    * lock(expr) stmt        -> Monitor lock (string => named lock)
 
 using System;
 using System.IO;
@@ -31,7 +28,8 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 
-using System.Windows.Forms; // if targeting net*-windows + UseWindowsForms
+// for WinForms projects (net*-windows + <UseWindowsForms>true</UseWindowsForms>)
+using System.Windows.Forms;
 
 namespace MiniJs
 {
@@ -48,6 +46,7 @@ namespace MiniJs
         WHILE, FOR, FOREACH, IN, BREAK, CONTINUE,
         IMPORT, AS,
         TASK, YIELD, LOCK,
+        AWAIT, JOIN,
 
         // punctuation
         LPAREN, RPAREN,
@@ -104,6 +103,8 @@ namespace MiniJs
             TokType.TASK => "TASK",
             TokType.YIELD => "YIELD",
             TokType.LOCK => "LOCK",
+            TokType.AWAIT => "AWAIT",
+            TokType.JOIN => "JOIN",
             TokType.LPAREN => "(",
             TokType.RPAREN => ")",
             TokType.LBRACE => "{",
@@ -241,6 +242,8 @@ namespace MiniJs
                     "task" => new Token(TokType.TASK, s, pos),
                     "yield" => new Token(TokType.YIELD, s, pos),
                     "lock" => new Token(TokType.LOCK, s, pos),
+                    "await" => new Token(TokType.AWAIT, s, pos),
+                    "join" => new Token(TokType.JOIN, s, pos),
                     "true" => new Token(TokType.TRUE_TOK, s, pos),
                     "false" => new Token(TokType.FALSE_TOK, s, pos),
                     "null" => new Token(TokType.NULL_TOK, s, pos),
@@ -359,6 +362,7 @@ namespace MiniJs
         TaskStmt,
         YieldStmt,
         LockStmt,
+        AwaitStmt,
 
         ExprStmt,
 
@@ -366,7 +370,10 @@ namespace MiniJs
         Var, Literal,
 
         ArrayLit, ObjectLit, FunctionExpr,
-        Member, Index, Call, NewExpr
+        Member, Index, Call, NewExpr,
+
+        TaskExpr,
+        AwaitExpr
     }
 
     sealed class Node
@@ -417,6 +424,7 @@ namespace MiniJs
             if (_cur.Type == TokType.TASK) return TaskStmt();
             if (_cur.Type == TokType.YIELD) return YieldStmt();
             if (_cur.Type == TokType.LOCK) return LockStmt();
+            if (_cur.Type == TokType.AWAIT || _cur.Type == TokType.JOIN) return AwaitStmt();
 
             if (_cur.Type == TokType.LBRACE) return Block();
             if (_cur.Type == TokType.LET || _cur.Type == TokType.VAR) return LetDecl(withSemi: true);
@@ -447,6 +455,18 @@ namespace MiniJs
             return n;
         }
 
+        private Node AwaitStmt()
+        {
+            Token at = _cur;
+            if (_cur.Type == TokType.AWAIT) Consume(TokType.AWAIT, "'await'");
+            else Consume(TokType.JOIN, "'join'");
+            var expr = Expression();
+            Match(TokType.SEMI);
+            var n = new Node(NodeType.AwaitStmt, at);
+            n.Kids.Add(expr);
+            return n;
+        }
+
         private Node YieldStmt()
         {
             Token yt = Consume(TokType.YIELD, "'yield'");
@@ -472,7 +492,6 @@ namespace MiniJs
         {
             Token it = Consume(TokType.IMPORT, "'import'");
 
-            // dotted name: IDENT ('.' IDENT)*
             Token first = Consume(TokType.IDENT, "import name");
             var full = new StringBuilder(first.Lexeme);
             while (Match(TokType.DOT))
@@ -481,7 +500,6 @@ namespace MiniJs
                 full.Append('.').Append(part.Lexeme);
             }
 
-            // optional alias
             Token aliasTok;
             if (Match(TokType.AS))
                 aliasTok = Consume(TokType.IDENT, "alias after 'as'");
@@ -692,7 +710,6 @@ namespace MiniJs
 
             while (_cur.Type != TokType.RBRACE && _cur.Type != TokType.EOF_TOK)
             {
-                // FIELD: var x; or var x = expr;
                 if (_cur.Type == TokType.VAR)
                 {
                     Consume(TokType.VAR, "'var' in class body");
@@ -707,7 +724,6 @@ namespace MiniJs
                     continue;
                 }
 
-                // METHOD
                 Token mname = Consume(TokType.IDENT, "method name");
                 Consume(TokType.LPAREN, "'('");
                 var paramsTok = new List<Token>();
@@ -733,7 +749,6 @@ namespace MiniJs
             return c;
         }
 
-        // expression := assignment
         private Node Expression() => Assignment();
 
         private Node Assignment()
@@ -900,6 +915,26 @@ namespace MiniJs
 
         private Node Unary()
         {
+            // task expr  (as expression)
+            if (_cur.Type == TokType.TASK)
+            {
+                Token tt = Consume(TokType.TASK, "'task'");
+                var u = new Node(NodeType.TaskExpr, tt);
+                u.Kids.Add(Unary());
+                return u;
+            }
+
+            // await/join expr (as expression)
+            if (_cur.Type == TokType.AWAIT || _cur.Type == TokType.JOIN)
+            {
+                Token at = _cur;
+                if (_cur.Type == TokType.AWAIT) Consume(TokType.AWAIT, "'await'");
+                else Consume(TokType.JOIN, "'join'");
+                var u = new Node(NodeType.AwaitExpr, at);
+                u.Kids.Add(Unary());
+                return u;
+            }
+
             if (_cur.Type == TokType.BANG || _cur.Type == TokType.PLUS || _cur.Type == TokType.MINUS ||
                 _cur.Type == TokType.BITNOT || _cur.Type == TokType.INC || _cur.Type == TokType.DEC)
             {
@@ -1103,6 +1138,8 @@ namespace MiniJs
         }
     }
 
+    // --- runtime objects ---
+
     sealed class JsArray { public List<object?> Items = new(); }
 
     sealed class JsObject
@@ -1139,10 +1176,7 @@ namespace MiniJs
 
             if (Parent != null) { Parent.Set(k, v); return; }
 
-            lock (_lock)
-            {
-                Vars[k] = v;
-            }
+            lock (_lock) Vars[k] = v;
         }
 
         public void Declare(string k, object? v)
@@ -1243,6 +1277,7 @@ namespace MiniJs
             if (v is ClrNamespace ns) return ns.ToString();
             if (v is Type t) return $"[type {t.FullName}]";
             if (v is ClrCallable) return "[clr-callable]";
+            if (v is JsTask) return "[task]";
 
             return v.ToString() ?? "";
         }
@@ -1275,6 +1310,30 @@ namespace MiniJs
         }
     }
 
+    // Task handle exposed to scripts (CLR object => properties/methods accessible)
+    sealed class JsTask
+    {
+        private readonly Task<object?> _task;
+
+        public JsTask(Task<object?> task) { _task = task; }
+
+        public bool Done => _task.IsCompleted;
+        public bool IsCompleted => _task.IsCompleted;
+        public bool IsFaulted => _task.IsFaulted;
+        public string Status => _task.Status.ToString();
+
+        // Non-blocking: null if not completed successfully
+        public object? Result => (_task.IsCompletedSuccessfully) ? _task.Result : null;
+
+        // Blocking wait (returns Result if success)
+        public object? Wait()
+        {
+            return _task.GetAwaiter().GetResult();
+        }
+
+        internal Task<object?> Task => _task;
+    }
+
     readonly struct EventKey
     {
         public readonly object Target;
@@ -1300,10 +1359,6 @@ namespace MiniJs
         // named locks for lock("name") { ... }
         private readonly object _namedLocksGuard = new();
         private readonly Dictionary<string, object> _namedLocks = new(StringComparer.Ordinal);
-
-        // keep references so they don't get GC'd unexpectedly; also handy for debugging
-        private readonly List<Task> _tasks = new();
-        private readonly object _tasksGuard = new();
 
         public Interpreter()
         {
@@ -1375,6 +1430,7 @@ namespace MiniJs
                 Function fa when b is Function fb => ReferenceEquals(fa, fb),
                 ClassDef ca when b is ClassDef cb => ReferenceEquals(ca, cb),
                 Type ta when b is Type tb => ReferenceEquals(ta, tb),
+                JsTask ta2 when b is JsTask tb2 => ReferenceEquals(ta2, tb2),
                 _ => a.Equals(b)
             };
         }
@@ -1400,7 +1456,6 @@ namespace MiniJs
                 return null;
             }
 
-            // your earlier convenience alias
             fullName = fullName switch
             {
                 "System.Collections.Generic.ArrayList" => "System.Collections.ArrayList",
@@ -1992,7 +2047,7 @@ namespace MiniJs
             {
                 if (args.Count != 0)
                     throw new Exception($"TypeError: cannot construct static class '{t.FullName}' with arguments");
-                return t; // treat static class as Type-handle
+                return t; // static class as Type-handle
             }
 
             if (t.IsAbstract || t.IsInterface)
@@ -2016,7 +2071,6 @@ namespace MiniJs
         {
             if (v is null) throw new Exception("TypeError: lock(expr) with null");
 
-            // named lock
             if (v is string s)
             {
                 lock (_namedLocksGuard)
@@ -2030,45 +2084,57 @@ namespace MiniJs
                 }
             }
 
-            // avoid locking on boxed primitives (bad identity)
             if (v is double or float or int or long or bool)
                 throw new Exception("TypeError: lock(expr) expects object or string name (not primitive)");
 
             return v;
         }
 
-        private void StartTask(Node expr, Env env)
+        private JsTask StartTask(Node expr, Env env)
         {
+            // Evaluate expression in background thread, return result
             var t = Task.Run(() =>
             {
-                try
-                {
-                    // Evaluate expression (typically a call) in background thread
-                    _ = Eval(expr, env);
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine(ex.Message);
-                }
+                // Let exceptions propagate to await/join
+                return Eval(expr, env);
             });
 
-            lock (_tasksGuard) _tasks.Add(t);
+            return new JsTask(t);
         }
 
-        private void YieldOnce()
+        private static object? AwaitAny(object? v)
         {
-            // let other tasks run, avoid busy-spin
-            Thread.Sleep(1);
+            if (v is null) return null;
 
-            // cleanup completed tasks (optional)
-            lock (_tasksGuard)
+            if (v is JsTask jt)
+                return jt.Task.GetAwaiter().GetResult();
+
+            if (v is Task t)
             {
-                for (int i = _tasks.Count - 1; i >= 0; i--)
+                // Task<T>?
+                var tt = t.GetType();
+                if (tt.IsGenericType && tt.GetGenericTypeDefinition() == typeof(Task<>))
                 {
-                    if (_tasks[i].IsCompleted) _tasks.RemoveAt(i);
+                    t.GetAwaiter().GetResult();
+                    var resProp = tt.GetProperty("Result", BindingFlags.Public | BindingFlags.Instance);
+                    return resProp?.GetValue(t);
                 }
+
+                t.GetAwaiter().GetResult();
+                return null;
             }
+
+            // also allow delegates returning Task / JsTask (convenient)
+            if (v is Delegate d)
+            {
+                var rv = d.DynamicInvoke();
+                return AwaitAny(rv);
+            }
+
+            throw new Exception("TypeError: await/join expects a task");
         }
+
+        private static void YieldOnce() => Thread.Sleep(1);
 
         // ---------------- LValue Get/Set ----------------
 
@@ -2252,6 +2318,18 @@ namespace MiniJs
                         var fn = new Function { Closure = env, Body = n.Kids[1]! };
                         foreach (var p in n.Kids[0]!.Kids) fn.Params.Add(p!.Tok.Lexeme);
                         return fn;
+                    }
+
+                case NodeType.TaskExpr:
+                    {
+                        // task <expr>  (expr evaluated inside the task)
+                        return StartTask(n.Kids[0]!, env);
+                    }
+
+                case NodeType.AwaitExpr:
+                    {
+                        var v = Eval(n.Kids[0]!, env);
+                        return AwaitAny(v);
                     }
 
                 case NodeType.Unary:
@@ -2537,7 +2615,14 @@ namespace MiniJs
 
                 case NodeType.TaskStmt:
                     {
-                        StartTask(n.Kids[0]!, env);
+                        _ = StartTask(n.Kids[0]!, env); // fire-and-forget
+                        return null;
+                    }
+
+                case NodeType.AwaitStmt:
+                    {
+                        var v = Eval(n.Kids[0]!, env);
+                        _ = AwaitAny(v);
                         return null;
                     }
 
@@ -2785,7 +2870,7 @@ namespace MiniJs
         {
             try
             {
-                // WinForms init (optional, but good)
+                // WinForms init (optional but nice)
                 try
                 {
                     Application.EnableVisualStyles();
