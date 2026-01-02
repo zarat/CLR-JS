@@ -1,12 +1,18 @@
 // Program.cs - tiny JavaScript-like interpreter (subset, JS-like-ish)
 //
-// Added:
-// - CLR interop via Reflection (namespace/type/method/property/field/indexer/ctor)
-// - import ... as ...; for CLR namespaces/types
-// - generic CLR event handling: obj.SomeEvent = function(sender, e){...}
-// - overload resolution now supports:
-//    * optional parameters
-//    * params (ParamArray) like DataGridViewRowCollection.Add(params object[])
+// Features:
+// - JS-ish lexer/parser/AST + interpreter
+// - CLR interop via Reflection:
+//    * System namespace root
+//    * member access / calls / new Type(...)
+//    * import X.Y as Alias;
+//    * generic CLR events: obj.Click = function(sender, e){...}
+// - overload resolution supports optional params + params (ParamArray)
+// - hidden/ambiguous members resolved to most-derived declaration (fixes TableLayoutPanel.Controls ambiguity)
+// - concurrency:
+//    * task <expr>;      -> runs expression on ThreadPool (fire-and-forget)
+//    * yield;            -> Thread.Sleep(1)
+//    * lock(expr) stmt   -> Monitor lock (string => named lock)
 //
 // Build (WinForms):
 //   <TargetFramework>net8.0-windows</TargetFramework>
@@ -22,8 +28,10 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
 
-using System.Windows.Forms; // only if you target net*-windows + UseWindowsForms
+using System.Windows.Forms; // if targeting net*-windows + UseWindowsForms
 
 namespace MiniJs
 {
@@ -39,6 +47,7 @@ namespace MiniJs
         LET, VAR, FUNCTION, CLASS, NEW, THIS, RETURN, IF, ELSE,
         WHILE, FOR, FOREACH, IN, BREAK, CONTINUE,
         IMPORT, AS,
+        TASK, YIELD, LOCK,
 
         // punctuation
         LPAREN, RPAREN,
@@ -92,6 +101,9 @@ namespace MiniJs
             TokType.CONTINUE => "CONTINUE",
             TokType.IMPORT => "IMPORT",
             TokType.AS => "AS",
+            TokType.TASK => "TASK",
+            TokType.YIELD => "YIELD",
+            TokType.LOCK => "LOCK",
             TokType.LPAREN => "(",
             TokType.RPAREN => ")",
             TokType.LBRACE => "{",
@@ -226,6 +238,9 @@ namespace MiniJs
                     "continue" => new Token(TokType.CONTINUE, s, pos),
                     "import" => new Token(TokType.IMPORT, s, pos),
                     "as" => new Token(TokType.AS, s, pos),
+                    "task" => new Token(TokType.TASK, s, pos),
+                    "yield" => new Token(TokType.YIELD, s, pos),
+                    "lock" => new Token(TokType.LOCK, s, pos),
                     "true" => new Token(TokType.TRUE_TOK, s, pos),
                     "false" => new Token(TokType.FALSE_TOK, s, pos),
                     "null" => new Token(TokType.NULL_TOK, s, pos),
@@ -341,6 +356,9 @@ namespace MiniJs
         BreakStmt, ContinueStmt,
 
         ImportStmt,
+        TaskStmt,
+        YieldStmt,
+        LockStmt,
 
         ExprStmt,
 
@@ -396,6 +414,10 @@ namespace MiniJs
         private Node Statement()
         {
             if (_cur.Type == TokType.IMPORT) return ImportStmt();
+            if (_cur.Type == TokType.TASK) return TaskStmt();
+            if (_cur.Type == TokType.YIELD) return YieldStmt();
+            if (_cur.Type == TokType.LOCK) return LockStmt();
+
             if (_cur.Type == TokType.LBRACE) return Block();
             if (_cur.Type == TokType.LET || _cur.Type == TokType.VAR) return LetDecl(withSemi: true);
             if (_cur.Type == TokType.FUNCTION) return FunctionDecl();
@@ -413,6 +435,37 @@ namespace MiniJs
             var s = new Node(NodeType.ExprStmt);
             s.Kids.Add(e);
             return s;
+        }
+
+        private Node TaskStmt()
+        {
+            Token tt = Consume(TokType.TASK, "'task'");
+            var expr = Expression();
+            Match(TokType.SEMI);
+            var n = new Node(NodeType.TaskStmt, tt);
+            n.Kids.Add(expr);
+            return n;
+        }
+
+        private Node YieldStmt()
+        {
+            Token yt = Consume(TokType.YIELD, "'yield'");
+            Match(TokType.SEMI);
+            return new Node(NodeType.YieldStmt, yt);
+        }
+
+        private Node LockStmt()
+        {
+            Token lt = Consume(TokType.LOCK, "'lock'");
+            Consume(TokType.LPAREN, "'(' after lock");
+            var expr = Expression();
+            Consume(TokType.RPAREN, "')' after lock(expr)");
+            var body = Statement();
+
+            var n = new Node(NodeType.LockStmt, lt);
+            n.Kids.Add(expr);
+            n.Kids.Add(body);
+            return n;
         }
 
         private Node ImportStmt()
@@ -683,7 +736,6 @@ namespace MiniJs
         // expression := assignment
         private Node Expression() => Assignment();
 
-        // assignment := logical_or ( ( '=' | '+=', ... ) assignment )?
         private Node Assignment()
         {
             var left = LogicalOr();
@@ -699,7 +751,7 @@ namespace MiniJs
                 Token op = _cur; _cur = _lex.Next();
                 var n = new Node(NodeType.Assign, op);
                 n.Kids.Add(left);
-                n.Kids.Add(Assignment()); // right-assoc
+                n.Kids.Add(Assignment());
                 return n;
             }
 
@@ -832,7 +884,6 @@ namespace MiniJs
             return n;
         }
 
-        // right-associative **
         private Node Power()
         {
             var n = Unary();
@@ -860,7 +911,6 @@ namespace MiniJs
             return Postfix();
         }
 
-        // postfix := primary ( '.' IDENT | '[' expr ']' | '(' args ')' )* ( '++' | '--' )?
         private Node Postfix()
         {
             var n = Primary();
@@ -891,7 +941,7 @@ namespace MiniJs
                 if (_cur.Type == TokType.LPAREN)
                 {
                     Token ct = Consume(TokType.LPAREN, "'('");
-                    var args = new Node(NodeType.Block, ct); // arg-list holder
+                    var args = new Node(NodeType.Block, ct);
                     if (_cur.Type != TokType.RPAREN)
                     {
                         args.Kids.Add(Expression());
@@ -951,7 +1001,6 @@ namespace MiniJs
             // new TypeName(...)
             if (Match(TokType.NEW))
             {
-                // dotted type name: IDENT ('.' IDENT)*
                 Token first = Consume(TokType.IDENT, "type name after new");
                 var full = new StringBuilder(first.Lexeme);
                 while (Match(TokType.DOT))
@@ -992,7 +1041,7 @@ namespace MiniJs
                 return arr;
             }
 
-            // object literal: {a: expr, "b": expr}
+            // object literal
             if (Match(TokType.LBRACE))
             {
                 var obj = new Node(NodeType.ObjectLit, new Token(TokType.LBRACE, "{", _cur.Pos));
@@ -1015,7 +1064,7 @@ namespace MiniJs
                         obj.Kids.Add(val);
 
                         if (!Match(TokType.COMMA)) break;
-                        if (_cur.Type == TokType.RBRACE) break; // trailing comma
+                        if (_cur.Type == TokType.RBRACE) break;
                     }
                 }
 
@@ -1023,7 +1072,7 @@ namespace MiniJs
                 return obj;
             }
 
-            // function expression: function(a,b){...} or function name(a,b){...}
+            // function expression
             if (_cur.Type == TokType.FUNCTION)
             {
                 Token ftok = Consume(TokType.FUNCTION, "'function'");
@@ -1054,8 +1103,6 @@ namespace MiniJs
         }
     }
 
-    // -------- Runtime --------
-
     sealed class JsArray { public List<object?> Items = new(); }
 
     sealed class JsObject
@@ -1067,6 +1114,7 @@ namespace MiniJs
 
     sealed class Env
     {
+        private readonly object _lock = new();
         public Env? Parent;
         public Dictionary<string, object?> Vars = new();
 
@@ -1074,26 +1122,39 @@ namespace MiniJs
 
         public object? Get(string k)
         {
-            if (Vars.TryGetValue(k, out var v)) return v;
+            lock (_lock)
+            {
+                if (Vars.TryGetValue(k, out var v)) return v;
+            }
             if (Parent != null) return Parent.Get(k);
             throw new Exception("ReferenceError: " + k + " is not defined");
         }
 
-        // sloppy-set: if exists up chain -> set there, else set in global root
         public void Set(string k, object? v)
         {
-            if (Vars.ContainsKey(k)) { Vars[k] = v; return; }
+            lock (_lock)
+            {
+                if (Vars.ContainsKey(k)) { Vars[k] = v; return; }
+            }
+
             if (Parent != null) { Parent.Set(k, v); return; }
-            Vars[k] = v;
+
+            lock (_lock)
+            {
+                Vars[k] = v;
+            }
         }
 
-        public void Declare(string k, object? v) => Vars[k] = v;
+        public void Declare(string k, object? v)
+        {
+            lock (_lock) Vars[k] = v;
+        }
     }
 
     sealed class Function
     {
         public List<string> Params = new();
-        public Node? Body;            // Block node
+        public Node? Body;
         public Env? Closure;
         public bool IsNative = false;
         public Func<List<object?>, object?, object?>? Native;
@@ -1102,12 +1163,11 @@ namespace MiniJs
     sealed class ClassDef
     {
         public string Name = "";
-        public Dictionary<string, Function> Methods = new();           // includes "constructor"
-        public List<(string name, Node? initExpr)> Fields = new();     // (name, initExpr)
-        public Env? Closure;                                           // for field init eval
+        public Dictionary<string, Function> Methods = new();
+        public List<(string name, Node? initExpr)> Fields = new();
+        public Env? Closure;
     }
 
-    // CLR bridge: namespace prefix like "System" or "System.Collections"
     sealed class ClrNamespace
     {
         public string Name;
@@ -1115,7 +1175,6 @@ namespace MiniJs
         public override string ToString() => $"[namespace {Name}]";
     }
 
-    // CLR bridge: bound method group (instance or static)
     sealed class ClrCallable
     {
         public object? Target; // instance or Type for static
@@ -1154,15 +1213,26 @@ namespace MiniJs
             if (v is long l) return l.ToString(CultureInfo.InvariantCulture);
 
             if (v is JsArray a)
-                return "[" + string.Join(", ", a.Items.Select(ToJsString)) + "]";
+            {
+                List<object?> snap;
+                lock (a) snap = a.Items.ToList();
+                return "[" + string.Join(", ", snap.Select(ToJsString)) + "]";
+            }
 
             if (v is JsObject o)
             {
-                IEnumerable<string> keys = o.Order.Count > 0 ? o.Order : o.Props.Keys;
+                List<string> keys;
+                Dictionary<string, object?> propsSnap;
+                lock (o)
+                {
+                    keys = (o.Order.Count > 0 ? o.Order : o.Props.Keys.ToList()).ToList();
+                    propsSnap = new Dictionary<string, object?>(o.Props);
+                }
+
                 var parts = new List<string>();
                 foreach (var k in keys)
                 {
-                    if (!o.Props.TryGetValue(k, out var vv)) continue;
+                    if (!propsSnap.TryGetValue(k, out var vv)) continue;
                     parts.Add(k + ": " + ToJsString(vv));
                 }
                 return "{" + string.Join(", ", parts) + "}";
@@ -1179,27 +1249,19 @@ namespace MiniJs
 
         public static double ToNumber(object? v)
         {
-            try
+            return v switch
             {
-                return v switch
-                {
-                    null => 0.0,
-                    double d => d,
-                    float f => f,
-                    int i => i,
-                    long l => l,
-                    bool b => b ? 1.0 : 0.0,
-                    string s => string.IsNullOrEmpty(s) ? 0.0 : double.Parse(s, CultureInfo.InvariantCulture),
-                    _ => double.Parse(ToJsString(v), CultureInfo.InvariantCulture)
-                };
-            }
-            catch
-            {
-                throw;
-            }
+                null => 0.0,
+                double d => d,
+                float f => f,
+                int i => i,
+                long l => l,
+                bool b => b ? 1.0 : 0.0,
+                string s => string.IsNullOrEmpty(s) ? 0.0 : double.Parse(s, CultureInfo.InvariantCulture),
+                _ => double.Parse(ToJsString(v), CultureInfo.InvariantCulture)
+            };
         }
 
-        // JS-like ToInt32
         public static int ToInt32(object? v)
         {
             double d = ToNumber(v);
@@ -1215,7 +1277,7 @@ namespace MiniJs
 
     readonly struct EventKey
     {
-        public readonly object Target; // reference identity (instance or Type)
+        public readonly object Target;
         public readonly string EventName;
         public EventKey(object target, string eventName) { Target = target; EventName = eventName; }
     }
@@ -1233,14 +1295,20 @@ namespace MiniJs
     {
         public Env Global;
 
-        // event subscriptions installed from script (so we can replace/remove on reassign)
         private readonly Dictionary<EventKey, List<Delegate>> _eventSubs = new(new EventKeyComparer());
+
+        // named locks for lock("name") { ... }
+        private readonly object _namedLocksGuard = new();
+        private readonly Dictionary<string, object> _namedLocks = new(StringComparer.Ordinal);
+
+        // keep references so they don't get GC'd unexpectedly; also handy for debugging
+        private readonly List<Task> _tasks = new();
+        private readonly object _tasksGuard = new();
 
         public Interpreter()
         {
             Global = new Env();
 
-            // builtin print(...)
             var pf = new Function
             {
                 IsNative = true,
@@ -1257,7 +1325,6 @@ namespace MiniJs
             };
             Global.Declare("print", pf);
 
-            // CLR root namespace
             Global.Declare("System", new ClrNamespace("System"));
         }
 
@@ -1312,56 +1379,7 @@ namespace MiniJs
             };
         }
 
-        // ---------------- CLR reflection helpers ----------------
-
-        private static int InheritanceDistance(Type start, Type? declaring)
-        {
-            int d = 0;
-            var cur = start;
-            while (cur != null)
-            {
-                if (cur == declaring) return d;
-                cur = cur.BaseType!;
-                d++;
-            }
-            return 9999;
-        }
-
-        private static PropertyInfo? FindBestProperty(Type t, string name, BindingFlags flags)
-        {
-            var props = t.GetProperties(flags)
-                .Where(p => p.Name == name && p.GetIndexParameters().Length == 0)
-                .ToArray();
-
-            if (props.Length == 0) return null;
-
-            // pick most-derived (smallest distance)
-            return props
-                .OrderBy(p => InheritanceDistance(t, p.DeclaringType))
-                .First();
-        }
-
-        private static FieldInfo? FindBestField(Type t, string name, BindingFlags flags)
-        {
-            // Fields can also be hidden; do same approach for robustness
-            var fields = t.GetFields(flags).Where(f => f.Name == name).ToArray();
-            if (fields.Length == 0) return null;
-
-            return fields
-                .OrderBy(f => InheritanceDistance(t, f.DeclaringType))
-                .First();
-        }
-
-        private static EventInfo? FindBestEvent(Type t, string name, BindingFlags flags)
-        {
-            var evs = t.GetEvents(flags).Where(e => e.Name == name).ToArray();
-            if (evs.Length == 0) return null;
-
-            return evs
-                .OrderBy(e => InheritanceDistance(t, e.DeclaringType))
-                .First();
-        }
-
+        // ---------------- CLR helpers ----------------
 
         private static Type? ResolveClrType(string fullName)
         {
@@ -1382,7 +1400,7 @@ namespace MiniJs
                 return null;
             }
 
-            // aliases (optional safety)
+            // your earlier convenience alias
             fullName = fullName switch
             {
                 "System.Collections.Generic.ArrayList" => "System.Collections.ArrayList",
@@ -1392,7 +1410,6 @@ namespace MiniJs
             var t1 = FindType(fullName);
             if (t1 != null) return t1;
 
-            // generic fallback: Foo -> Foo`1<object>, Foo`2<object,object>, etc.
             for (int arity = 1; arity <= 4; arity++)
             {
                 var open = FindType(fullName + "`" + arity);
@@ -1492,31 +1509,25 @@ namespace MiniJs
         {
             bool hasParams = HasParamArray(ps);
 
-            // optional params (no param-array)
             if (!hasParams)
             {
                 if (args.Count > ps.Length) throw new Exception("TypeError: too many arguments");
 
                 var conv = new object?[ps.Length];
 
-                // provided args
                 for (int i = 0; i < args.Count; i++)
                     conv[i] = ConvertArg(args[i], ps[i].ParameterType);
 
-                // fill missing optional args
                 for (int i = args.Count; i < ps.Length; i++)
                 {
                     if (!ps[i].IsOptional)
                         throw new Exception("TypeError: not enough arguments");
-
-                    // Let reflection apply default value
                     conv[i] = Type.Missing;
                 }
 
                 return conv;
             }
 
-            // params array case: pack remaining arguments into last array parameter
             int fixedCount = ps.Length - 1;
             if (args.Count < fixedCount) throw new Exception("TypeError: not enough arguments");
 
@@ -1528,7 +1539,6 @@ namespace MiniJs
             var arrParamType = ps[^1].ParameterType;
             var elemType = arrParamType.GetElementType() ?? typeof(object);
 
-            // If caller already passed an array as the last arg AND counts match, accept it directly
             if (args.Count == ps.Length && args[^1] != null && arrParamType.IsInstanceOfType(args[^1]))
             {
                 res[^1] = args[^1];
@@ -1559,7 +1569,6 @@ namespace MiniJs
                 {
                     if (args.Count > ps.Length) continue;
 
-                    // missing must be optional
                     bool ok = true;
                     for (int i = args.Count; i < ps.Length; i++)
                         if (!ps[i].IsOptional) { ok = false; break; }
@@ -1574,9 +1583,7 @@ namespace MiniJs
                     }
                     if (!ok) continue;
 
-                    // small penalty for each optional param not supplied
                     score += (ps.Length - args.Count) * 5;
-
                     if (score < bestScore) { bestScore = score; best = m; }
                 }
                 else
@@ -1587,7 +1594,6 @@ namespace MiniJs
                     bool ok = true;
                     int score = 0;
 
-                    // fixed part
                     for (int i = 0; i < fixedCount; i++)
                     {
                         int s = ScoreArg(args[i], ps[i].ParameterType);
@@ -1596,13 +1602,12 @@ namespace MiniJs
                     }
                     if (!ok) continue;
 
-                    // var part against element type
                     var elemType = ps[^1].ParameterType.GetElementType() ?? typeof(object);
                     for (int j = fixedCount; j < args.Count; j++)
                     {
                         int s = ScoreArg(args[j], elemType);
                         if (s == int.MaxValue) { ok = false; break; }
-                        score += s + 1; // tiny penalty per packed element
+                        score += s + 1;
                     }
                     if (!ok) continue;
 
@@ -1643,7 +1648,6 @@ namespace MiniJs
                     if (!ok) continue;
 
                     score += (ps.Length - args.Count) * 5;
-
                     if (score < bestScore) { bestScore = score; best = c; }
                 }
                 else
@@ -1679,9 +1683,49 @@ namespace MiniJs
             return best;
         }
 
+        // ---------- AmbiguousMatch fix: pick most-derived hidden member ----------
+
+        private static int InheritanceDistance(Type start, Type? declaring)
+        {
+            int d = 0;
+            var cur = start;
+            while (cur != null)
+            {
+                if (cur == declaring) return d;
+                cur = cur.BaseType!;
+                d++;
+            }
+            return 9999;
+        }
+
+        private static PropertyInfo? FindBestProperty(Type t, string name, BindingFlags flags)
+        {
+            var props = t.GetProperties(flags)
+                .Where(p => p.Name == name && p.GetIndexParameters().Length == 0)
+                .ToArray();
+            if (props.Length == 0) return null;
+
+            return props.OrderBy(p => InheritanceDistance(t, p.DeclaringType)).First();
+        }
+
+        private static FieldInfo? FindBestField(Type t, string name, BindingFlags flags)
+        {
+            var fields = t.GetFields(flags).Where(f => f.Name == name).ToArray();
+            if (fields.Length == 0) return null;
+
+            return fields.OrderBy(f => InheritanceDistance(t, f.DeclaringType)).First();
+        }
+
+        private static EventInfo? FindBestEvent(Type t, string name, BindingFlags flags)
+        {
+            var evs = t.GetEvents(flags).Where(e => e.Name == name).ToArray();
+            if (evs.Length == 0) return null;
+
+            return evs.OrderBy(e => InheritanceDistance(t, e.DeclaringType)).First();
+        }
+
         private static object? GetClrMember(object recvOrTypeOrNs, string name)
         {
-            // namespace: append & maybe resolve to Type
             if (recvOrTypeOrNs is ClrNamespace ns)
             {
                 string candidate = ns.Name + "." + name;
@@ -1690,13 +1734,9 @@ namespace MiniJs
                 return new ClrNamespace(candidate);
             }
 
-            // static via Type
             if (recvOrTypeOrNs is Type st)
             {
                 var flags = BindingFlags.Public | BindingFlags.Static;
-
-                var evS = FindBestEvent(st, name, flags);
-                if (evS != null) return evS; // optional: falls du Events auch "lesen" willst (meist nicht nötig)
 
                 var p = FindBestProperty(st, name, flags);
                 if (p != null) return p.GetValue(null);
@@ -1704,10 +1744,12 @@ namespace MiniJs
                 var f = FindBestField(st, name, flags);
                 if (f != null) return f.GetValue(null);
 
+                var ms = st.GetMethods(flags).Where(m => m.Name == name).ToArray();
+                if (ms.Length > 0) return new ClrCallable(st, name);
+
                 return null;
             }
 
-            // instance
             var recv = recvOrTypeOrNs;
             var rt = recv.GetType();
             var iflags = BindingFlags.Public | BindingFlags.Instance;
@@ -1724,7 +1766,7 @@ namespace MiniJs
             return null;
         }
 
-        // ---------- Generic event handling: obj.Event = function(...) {...} ----------
+        // ---------- Events: obj.Event = function(...) { ... } ----------
 
         private object? InvokeScriptForEvent(Function fn, object?[] args)
         {
@@ -1781,7 +1823,6 @@ namespace MiniJs
             object keyTarget = staticTypeKey != null ? (object)staticTypeKey : (instanceTarget ?? throw new Exception("TypeError: event on null"));
             var key = new EventKey(keyTarget, ev.Name);
 
-            // remove previous script handlers for this event
             if (_eventSubs.TryGetValue(key, out var oldList))
             {
                 foreach (var d in oldList)
@@ -1789,7 +1830,6 @@ namespace MiniJs
                 _eventSubs.Remove(key);
             }
 
-            // assign null => clear
             if (value == null) return;
 
             if (value is Function fn)
@@ -1811,27 +1851,14 @@ namespace MiniJs
             {
                 var flags = BindingFlags.Public | BindingFlags.Static;
 
-                // events (static)
-                var evS = st.GetEvent(name, flags);
-                if (evS != null)
-                {
-                    SetClrEventHandler(null, st, evS, value);
-                    return;
-                }
+                var evS = FindBestEvent(st, name, flags);
+                if (evS != null) { SetClrEventHandler(null, st, evS, value); return; }
 
-                var p = st.GetProperty(name, flags);
-                if (p != null)
-                {
-                    p.SetValue(null, ConvertArg(value, p.PropertyType));
-                    return;
-                }
+                var p = FindBestProperty(st, name, flags);
+                if (p != null) { p.SetValue(null, ConvertArg(value, p.PropertyType)); return; }
 
-                var f = st.GetField(name, flags);
-                if (f != null)
-                {
-                    f.SetValue(null, ConvertArg(value, f.FieldType));
-                    return;
-                }
+                var f = FindBestField(st, name, flags);
+                if (f != null) { f.SetValue(null, ConvertArg(value, f.FieldType)); return; }
 
                 throw new Exception($"TypeError: static member '{name}' not found or not settable");
             }
@@ -1840,15 +1867,10 @@ namespace MiniJs
             var rt = recv.GetType();
             var flagsI = BindingFlags.Public | BindingFlags.Instance;
 
-            // events (instance)
-            var evI = rt.GetEvent(name, flagsI);
-            if (evI != null)
-            {
-                SetClrEventHandler(recv, null, evI, value);
-                return;
-            }
+            var evI = FindBestEvent(rt, name, flagsI);
+            if (evI != null) { SetClrEventHandler(recv, null, evI, value); return; }
 
-            var ip = rt.GetProperty(name, flagsI);
+            var ip = FindBestProperty(rt, name, flagsI);
             if (ip != null)
             {
                 if (!ip.CanWrite) throw new Exception($"TypeError: property '{name}' is read-only");
@@ -1856,12 +1878,8 @@ namespace MiniJs
                 return;
             }
 
-            var iff = rt.GetField(name, flagsI);
-            if (iff != null)
-            {
-                iff.SetValue(recv, ConvertArg(value, iff.FieldType));
-                return;
-            }
+            var iff = FindBestField(rt, name, flagsI);
+            if (iff != null) { iff.SetValue(recv, ConvertArg(value, iff.FieldType)); return; }
 
             throw new Exception($"TypeError: member '{name}' not found or not settable");
         }
@@ -1888,7 +1906,6 @@ namespace MiniJs
                 return dict[key];
             }
 
-            // default indexer Item[...]
             var t = recv.GetType();
             var props = t.GetDefaultMembers().OfType<PropertyInfo>().ToArray();
             foreach (var p in props)
@@ -1930,7 +1947,6 @@ namespace MiniJs
                 return;
             }
 
-            // default indexer Item[...]
             var t = recv.GetType();
             var props = t.GetDefaultMembers().OfType<PropertyInfo>().ToArray();
             foreach (var p in props)
@@ -1972,12 +1988,11 @@ namespace MiniJs
 
         private static object CreateClrInstance(Type t, List<object?> args)
         {
-            // optional: treat static classes as "Type handles"
             if (t.IsAbstract && t.IsSealed)
             {
                 if (args.Count != 0)
                     throw new Exception($"TypeError: cannot construct static class '{t.FullName}' with arguments");
-                return t;
+                return t; // treat static class as Type-handle
             }
 
             if (t.IsAbstract || t.IsInterface)
@@ -1995,9 +2010,68 @@ namespace MiniJs
             return best.Invoke(conv);
         }
 
-        // ---------------- LValue Get/Set (vars, jsobj, jsarr, clr) ----------------
+        // ---------------- Concurrency helpers ----------------
 
-        // outKind: 0=var, 1=member, 2=index
+        private object GetLockObject(object? v)
+        {
+            if (v is null) throw new Exception("TypeError: lock(expr) with null");
+
+            // named lock
+            if (v is string s)
+            {
+                lock (_namedLocksGuard)
+                {
+                    if (!_namedLocks.TryGetValue(s, out var o))
+                    {
+                        o = new object();
+                        _namedLocks[s] = o;
+                    }
+                    return o;
+                }
+            }
+
+            // avoid locking on boxed primitives (bad identity)
+            if (v is double or float or int or long or bool)
+                throw new Exception("TypeError: lock(expr) expects object or string name (not primitive)");
+
+            return v;
+        }
+
+        private void StartTask(Node expr, Env env)
+        {
+            var t = Task.Run(() =>
+            {
+                try
+                {
+                    // Evaluate expression (typically a call) in background thread
+                    _ = Eval(expr, env);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(ex.Message);
+                }
+            });
+
+            lock (_tasksGuard) _tasks.Add(t);
+        }
+
+        private void YieldOnce()
+        {
+            // let other tasks run, avoid busy-spin
+            Thread.Sleep(1);
+
+            // cleanup completed tasks (optional)
+            lock (_tasksGuard)
+            {
+                for (int i = _tasks.Count - 1; i >= 0; i--)
+                {
+                    if (_tasks[i].IsCompleted) _tasks.RemoveAt(i);
+                }
+            }
+        }
+
+        // ---------------- LValue Get/Set ----------------
+
         private object? EvalLValueGet(Node target, Env env, ref object? outRecv, ref string outProp, ref object? outIdx, ref int outKind)
         {
             if (target.Type == NodeType.Var)
@@ -2015,14 +2089,16 @@ namespace MiniJs
 
                 if (outRecv is JsObject jo)
                 {
-                    if (jo.Props.TryGetValue(outProp, out var v)) return v;
-                    if (jo.Klass != null && jo.Klass.Methods.TryGetValue(outProp, out var mfn))
-                        return mfn;
+                    lock (jo)
+                    {
+                        if (jo.Props.TryGetValue(outProp, out var v)) return v;
+                        if (jo.Klass != null && jo.Klass.Methods.TryGetValue(outProp, out var mfn))
+                            return mfn;
+                    }
                     return null;
                 }
 
                 if (outRecv is null) throw new Exception("TypeError: member access on null");
-
                 return GetClrMember(outRecv, outProp);
             }
 
@@ -2034,20 +2110,25 @@ namespace MiniJs
 
                 if (outRecv is JsArray a)
                 {
-                    long i = (long)Rt.ToNumber(outIdx);
-                    if (i < 0 || i >= a.Items.Count) return null;
-                    return a.Items[(int)i];
+                    lock (a)
+                    {
+                        long i = (long)Rt.ToNumber(outIdx);
+                        if (i < 0 || i >= a.Items.Count) return null;
+                        return a.Items[(int)i];
+                    }
                 }
 
                 if (outRecv is JsObject o)
                 {
                     string key = Rt.ToJsString(outIdx);
-                    if (o.Props.TryGetValue(key, out var v)) return v;
+                    lock (o)
+                    {
+                        if (o.Props.TryGetValue(key, out var v)) return v;
+                    }
                     return null;
                 }
 
                 if (outRecv is null) throw new Exception("TypeError: index access on null");
-
                 return GetClrIndex(outRecv, outIdx);
             }
 
@@ -2062,8 +2143,11 @@ namespace MiniJs
             {
                 if (recv is JsObject o)
                 {
-                    if (!o.Props.ContainsKey(prop)) o.Order.Add(prop);
-                    o.Props[prop] = newVal;
+                    lock (o)
+                    {
+                        if (!o.Props.ContainsKey(prop)) o.Order.Add(prop);
+                        o.Props[prop] = newVal;
+                    }
                     return;
                 }
 
@@ -2076,19 +2160,25 @@ namespace MiniJs
             {
                 if (recv is JsArray a)
                 {
-                    long i = (long)Rt.ToNumber(idx);
-                    if (i < 0) throw new Exception("RangeError: negative index");
-                    int ui = (int)i;
-                    while (a.Items.Count <= ui) a.Items.Add(null);
-                    a.Items[ui] = newVal;
+                    lock (a)
+                    {
+                        long i = (long)Rt.ToNumber(idx);
+                        if (i < 0) throw new Exception("RangeError: negative index");
+                        int ui = (int)i;
+                        while (a.Items.Count <= ui) a.Items.Add(null);
+                        a.Items[ui] = newVal;
+                    }
                     return;
                 }
 
                 if (recv is JsObject o)
                 {
                     string k = Rt.ToJsString(idx);
-                    if (!o.Props.ContainsKey(k)) o.Order.Add(k);
-                    o.Props[k] = newVal;
+                    lock (o)
+                    {
+                        if (!o.Props.ContainsKey(k)) o.Order.Add(k);
+                        o.Props[k] = newVal;
+                    }
                     return;
                 }
 
@@ -2148,8 +2238,11 @@ namespace MiniJs
                             var keyNode = n.Kids[i]!;
                             var valNode = n.Kids[i + 1]!;
                             string k = keyNode.Tok.Lexeme;
-                            if (!o.Props.ContainsKey(k)) o.Order.Add(k);
-                            o.Props[k] = Eval(valNode, env);
+                            lock (o)
+                            {
+                                if (!o.Props.ContainsKey(k)) o.Order.Add(k);
+                                o.Props[k] = Eval(valNode, env);
+                            }
                         }
                         return o;
                     }
@@ -2220,30 +2313,29 @@ namespace MiniJs
                         object? l2 = Eval(n.Kids[0]!, env);
                         object? r2 = Eval(n.Kids[1]!, env);
 
-                        switch (n.Tok.Type)
+                        return n.Tok.Type switch
                         {
-                            case TokType.PLUS: return BinaryPlus(l2, r2);
-                            case TokType.MINUS: return Rt.ToNumber(l2) - Rt.ToNumber(r2);
-                            case TokType.MUL: return Rt.ToNumber(l2) * Rt.ToNumber(r2);
-                            case TokType.DIV: return Rt.ToNumber(l2) / Rt.ToNumber(r2);
-                            case TokType.MOD: return Rt.ToNumber(l2) % Rt.ToNumber(r2);
-                            case TokType.POW: return Math.Pow(Rt.ToNumber(l2), Rt.ToNumber(r2));
+                            TokType.PLUS => BinaryPlus(l2, r2),
+                            TokType.MINUS => Rt.ToNumber(l2) - Rt.ToNumber(r2),
+                            TokType.MUL => Rt.ToNumber(l2) * Rt.ToNumber(r2),
+                            TokType.DIV => Rt.ToNumber(l2) / Rt.ToNumber(r2),
+                            TokType.MOD => Rt.ToNumber(l2) % Rt.ToNumber(r2),
+                            TokType.POW => Math.Pow(Rt.ToNumber(l2), Rt.ToNumber(r2)),
 
-                            case TokType.LT: return Rt.ToNumber(l2) < Rt.ToNumber(r2);
-                            case TokType.LEQ: return Rt.ToNumber(l2) <= Rt.ToNumber(r2);
-                            case TokType.GT: return Rt.ToNumber(l2) > Rt.ToNumber(r2);
-                            case TokType.GEQ: return Rt.ToNumber(l2) >= Rt.ToNumber(r2);
+                            TokType.LT => Rt.ToNumber(l2) < Rt.ToNumber(r2),
+                            TokType.LEQ => Rt.ToNumber(l2) <= Rt.ToNumber(r2),
+                            TokType.GT => Rt.ToNumber(l2) > Rt.ToNumber(r2),
+                            TokType.GEQ => Rt.ToNumber(l2) >= Rt.ToNumber(r2),
 
-                            case TokType.BITAND: return (double)(Rt.ToInt32(l2) & Rt.ToInt32(r2));
-                            case TokType.BITOR: return (double)(Rt.ToInt32(l2) | Rt.ToInt32(r2));
-                            case TokType.BITXOR: return (double)(Rt.ToInt32(l2) ^ Rt.ToInt32(r2));
+                            TokType.BITAND => (double)(Rt.ToInt32(l2) & Rt.ToInt32(r2)),
+                            TokType.BITOR => (double)(Rt.ToInt32(l2) | Rt.ToInt32(r2)),
+                            TokType.BITXOR => (double)(Rt.ToInt32(l2) ^ Rt.ToInt32(r2)),
 
-                            case TokType.EQ: return EqualsForRuntime(l2, r2);
-                            case TokType.NEQ: return !EqualsForRuntime(l2, r2);
+                            TokType.EQ => EqualsForRuntime(l2, r2),
+                            TokType.NEQ => !EqualsForRuntime(l2, r2),
 
-                            default:
-                                throw new Exception("Unknown binary op");
-                        }
+                            _ => throw new Exception("Unknown binary op")
+                        };
                     }
 
                 case NodeType.Member:
@@ -2253,15 +2345,21 @@ namespace MiniJs
 
                         if (recv is JsArray a)
                         {
-                            if (prop == "length") return (double)a.Items.Count;
+                            lock (a)
+                            {
+                                if (prop == "length") return (double)a.Items.Count;
+                            }
                             return null;
                         }
 
                         if (recv is JsObject o)
                         {
-                            if (o.Props.TryGetValue(prop, out var v)) return v;
-                            if (o.Klass != null && o.Klass.Methods.TryGetValue(prop, out var mfn))
-                                return mfn;
+                            lock (o)
+                            {
+                                if (o.Props.TryGetValue(prop, out var v)) return v;
+                                if (o.Klass != null && o.Klass.Methods.TryGetValue(prop, out var mfn))
+                                    return mfn;
+                            }
                             return null;
                         }
 
@@ -2276,15 +2374,21 @@ namespace MiniJs
 
                         if (recv is JsArray a)
                         {
-                            long i = (long)Rt.ToNumber(idx);
-                            if (i < 0 || i >= a.Items.Count) return null;
-                            return a.Items[(int)i];
+                            lock (a)
+                            {
+                                long i = (long)Rt.ToNumber(idx);
+                                if (i < 0 || i >= a.Items.Count) return null;
+                                return a.Items[(int)i];
+                            }
                         }
 
                         if (recv is JsObject o)
                         {
                             string key = Rt.ToJsString(idx);
-                            if (o.Props.TryGetValue(key, out var v)) return v;
+                            lock (o)
+                            {
+                                if (o.Props.TryGetValue(key, out var v)) return v;
+                            }
                             return null;
                         }
 
@@ -2320,7 +2424,6 @@ namespace MiniJs
 
                 case NodeType.NewExpr:
                     {
-                        // 1) Script class preferred: new Test(...)
                         string firstIdent = n.Tok.Lexeme;
                         object? sym = null;
                         bool hasSym = true;
@@ -2334,10 +2437,13 @@ namespace MiniJs
 
                             if (sc.Fields.Count > 0)
                             {
-                                foreach (var f in sc.Fields)
+                                lock (obj)
                                 {
-                                    if (!obj.Props.ContainsKey(f.name)) obj.Order.Add(f.name);
-                                    obj.Props[f.name] = null;
+                                    foreach (var f in sc.Fields)
+                                    {
+                                        if (!obj.Props.ContainsKey(f.name)) obj.Order.Add(f.name);
+                                        obj.Props[f.name] = null;
+                                    }
                                 }
 
                                 var initEnv = new Env(sc.Closure);
@@ -2347,7 +2453,7 @@ namespace MiniJs
                                 {
                                     object? fv = null;
                                     if (f.initExpr != null) fv = Eval(f.initExpr, initEnv);
-                                    obj.Props[f.name] = fv;
+                                    lock (obj) obj.Props[f.name] = fv;
                                 }
                             }
 
@@ -2360,17 +2466,13 @@ namespace MiniJs
                             return obj;
                         }
 
-                        // 2) CLR class: new System.X.Y.Type(...) OR new Alias.Type(...)
                         Type? t = null;
 
-                        // Allow: let T = System.String; new T("x")
-                        if (hasSym && sym is Type st)
-                            t = st;
+                        if (hasSym && sym is Type st) t = st;
 
-                        // Allow: import System.Windows.Forms as WinForms; new WinForms.Form()
                         if (t == null && hasSym && sym is ClrNamespace ns)
                         {
-                            string full = n.Text; // e.g. WinForms.Form
+                            string full = n.Text;
                             if (full == firstIdent) full = ns.Name;
                             else if (full.StartsWith(firstIdent + ".", StringComparison.Ordinal))
                                 full = ns.Name + full.Substring(firstIdent.Length);
@@ -2431,6 +2533,36 @@ namespace MiniJs
 
                         env.Declare(alias, val);
                         return val;
+                    }
+
+                case NodeType.TaskStmt:
+                    {
+                        StartTask(n.Kids[0]!, env);
+                        return null;
+                    }
+
+                case NodeType.YieldStmt:
+                    {
+                        YieldOnce();
+                        return null;
+                    }
+
+                case NodeType.LockStmt:
+                    {
+                        var lkExpr = n.Kids[0]!;
+                        var body = n.Kids[1]!;
+                        object? lkVal = Eval(lkExpr, env);
+                        object lkObj = GetLockObject(lkVal);
+
+                        Monitor.Enter(lkObj);
+                        try
+                        {
+                            return Exec(body, env);
+                        }
+                        finally
+                        {
+                            Monitor.Exit(lkObj);
+                        }
                     }
 
                 case NodeType.LetDecl:
@@ -2561,14 +2693,17 @@ namespace MiniJs
 
                         if (itv is JsArray a)
                         {
-                            for (int i = 0; i < a.Items.Count; i++)
+                            List<object?> snap;
+                            lock (a) snap = a.Items.ToList();
+
+                            for (int i = 0; i < snap.Count; i++)
                             {
                                 if (v2 != null)
                                 {
                                     loopEnv.Set(name1, (double)i);
-                                    loopEnv.Set(name2, a.Items[i]);
+                                    loopEnv.Set(name2, snap[i]);
                                 }
-                                else loopEnv.Set(name1, a.Items[i]);
+                                else loopEnv.Set(name1, snap[i]);
 
                                 try { Exec(body, loopEnv); }
                                 catch (ContinueSignal) { continue; }
@@ -2579,10 +2714,17 @@ namespace MiniJs
 
                         if (itv is JsObject o)
                         {
-                            IEnumerable<string> keys = o.Order.Count > 0 ? o.Order : o.Props.Keys;
+                            List<string> keys;
+                            Dictionary<string, object?> propsSnap;
+                            lock (o)
+                            {
+                                keys = (o.Order.Count > 0 ? o.Order : o.Props.Keys.ToList()).ToList();
+                                propsSnap = new Dictionary<string, object?>(o.Props);
+                            }
+
                             foreach (var k in keys)
                             {
-                                if (!o.Props.TryGetValue(k, out var vv)) continue;
+                                if (!propsSnap.TryGetValue(k, out var vv)) continue;
 
                                 if (v2 != null)
                                 {
@@ -2634,31 +2776,6 @@ namespace MiniJs
         }
     }
 
-    static class AstDump
-    {
-        public static void Dump(Node? n, int indent = 0)
-        {
-            if (n == null)
-            {
-                Console.WriteLine(new string(' ', indent) + "(null)");
-                return;
-            }
-
-            string pad = new string(' ', indent);
-            Console.Write(pad + n.Type);
-
-            if (n.Tok.Type != TokType.EOF_TOK || !string.IsNullOrEmpty(n.Tok.Lexeme))
-                Console.Write($"  tok={Tok.Name(n.Tok.Type)} '{n.Tok.Lexeme}' @{n.Tok.Pos}");
-
-            if (!string.IsNullOrEmpty(n.Text))
-                Console.Write($"  text='{n.Text}'");
-
-            Console.WriteLine();
-
-            foreach (var k in n.Kids) Dump(k, indent + 2);
-        }
-    }
-
     static class Program
     {
         static string ReadFile(string path) => File.ReadAllText(path);
@@ -2668,7 +2785,7 @@ namespace MiniJs
         {
             try
             {
-                // WinForms init (required for UI behavior)
+                // WinForms init (optional, but good)
                 try
                 {
                     Application.EnableVisualStyles();
@@ -2676,42 +2793,13 @@ namespace MiniJs
                 }
                 catch { }
 
-                string code;
-
-                if (args.Length >= 1)
-                {
-                    code = ReadFile(args[0]);
-                }
-                else
-                {
-                    code =
-                        "import System.Windows.Forms as WinForms;\n" +
-                        "let form = new WinForms.Form();\n" +
-                        "form.Text = \"DGV Demo\";\n" +
-                        "form.Width = 800;\n" +
-                        "form.Height = 400;\n" +
-                        "\n" +
-                        "let dgv = new WinForms.DataGridView();\n" +
-                        "dgv.Dock = WinForms.DockStyle.Fill;\n" +
-                        "dgv.AllowUserToAddRows = false;\n" +
-                        "dgv.AutoSizeColumnsMode = WinForms.DataGridViewAutoSizeColumnsMode.Fill;\n" +
-                        "\n" +
-                        "dgv.Columns.Add(\"colName\", \"Name\");\n" +
-                        "dgv.Columns.Add(\"colValue\", \"Value\");\n" +
-                        "\n" +
-                        "dgv.Rows.Add(\"Alice\", \"123\");\n" +
-                        "dgv.Rows.Add(\"Bob\", \"456\");\n" +
-                        "\n" +
-                        "form.Controls.Add(dgv);\n" +
-                        "form.ShowDialog();\n";
-                }
+                string code = args.Length >= 1
+                    ? ReadFile(args[0])
+                    : "print(\"MiniJs ready\");\n";
 
                 var lx = new Lexer(code);
                 var ps = new Parser(lx);
                 var ast = ps.ParseProgram();
-
-                // optional
-                AstDump.Dump(ast);
 
                 var it = new Interpreter();
                 it.Eval(ast, it.Global);
