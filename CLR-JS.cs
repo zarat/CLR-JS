@@ -1,26 +1,6 @@
-// Program.cs - tiny JavaScript-like interpreter (subset, JS-like-ish)
-//
-// Features:
-// - JS-ish lexer/parser/AST + interpreter
-// - CLR interop via Reflection:
-//    * System namespace root
-//    * member access / calls / new Type(...)
-//    * import X.Y as Alias;
-//    * generic CLR events: obj.Click = function(sender, e){...}
-// - overload resolution supports optional params + params (ParamArray)
-// - hidden/ambiguous members resolved to most-derived declaration (fixes TableLayoutPanel.Controls ambiguity)
-// - concurrency:
-//    * task <expr>                 -> starts via queue/limit; RETURNS handle (JsTask) when used as expression
-//    * task { ... }                -> starts block in background; RETURNS handle (JsTask) when used as expression
-//    * task <expr>; / task {..};   -> fire-and-forget statement
-//    * await <expr> / join <expr>  -> waits; returns result for JsTask or Task<T>
-//    * yield;                      -> Thread.Sleep(1)
-//    * lock(expr) stmt             -> Monitor lock (string => named lock)
-//
-// Builtins (task control):
-//    setTaskLimit(n)
-//    setTaskQueueLimit(n)
-//    taskStats() -> { MaxConcurrency: n, QueueLimit: m, Queued: q }
+// Program.cs - MiniJs: JS-like-ish interpreter with CLR interop + WinForms helpers + tasks
+// Build: dotnet build
+// Run:   dotnet run -- [file]
 
 using System;
 using System.IO;
@@ -34,7 +14,7 @@ using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
-
+using System.ComponentModel;
 using System.Windows.Forms;
 
 namespace MiniJs
@@ -48,7 +28,9 @@ namespace MiniJs
 
         LET, VAR, FUNCTION, CLASS, NEW, THIS, RETURN, IF, ELSE,
         WHILE, FOR, FOREACH, IN, BREAK, CONTINUE,
+
         IMPORT, AS,
+
         TASK, YIELD, LOCK,
         AWAIT, JOIN,
 
@@ -57,21 +39,21 @@ namespace MiniJs
         LBRACK, RBRACK,
         COMMA, SEMI, DOT, COLON,
 
-        ASSIGN,
+        ASSIGN, // =
         PLUS_ASSIGN, MINUS_ASSIGN, MUL_ASSIGN, DIV_ASSIGN, MOD_ASSIGN,
 
         EQ, NEQ, LT, GT, LEQ, GEQ,
 
         PLUS, MINUS, MUL, DIV, MOD,
-        POW,
+        POW,           // **
 
         BITAND, BITXOR, BITOR,
         AND, OR,
 
-        INC, DEC,
+        INC, DEC,      // ++ --
 
-        BITNOT,
-        BANG
+        BITNOT,        // ~
+        BANG           // !
     }
 
     static class Tok
@@ -85,6 +67,7 @@ namespace MiniJs
             TokType.TRUE_TOK => "TRUE",
             TokType.FALSE_TOK => "FALSE",
             TokType.NULL_TOK => "NULL",
+
             TokType.LET => "LET",
             TokType.VAR => "VAR",
             TokType.FUNCTION => "FUNCTION",
@@ -100,13 +83,16 @@ namespace MiniJs
             TokType.IN => "IN",
             TokType.BREAK => "BREAK",
             TokType.CONTINUE => "CONTINUE",
+
             TokType.IMPORT => "IMPORT",
             TokType.AS => "AS",
+
             TokType.TASK => "TASK",
             TokType.YIELD => "YIELD",
             TokType.LOCK => "LOCK",
             TokType.AWAIT => "AWAIT",
             TokType.JOIN => "JOIN",
+
             TokType.LPAREN => "(",
             TokType.RPAREN => ")",
             TokType.LBRACE => "{",
@@ -117,33 +103,40 @@ namespace MiniJs
             TokType.SEMI => ";",
             TokType.DOT => ".",
             TokType.COLON => ":",
+
             TokType.ASSIGN => "=",
             TokType.PLUS_ASSIGN => "+=",
             TokType.MINUS_ASSIGN => "-=",
             TokType.MUL_ASSIGN => "*=",
             TokType.DIV_ASSIGN => "/=",
             TokType.MOD_ASSIGN => "%=",
+
             TokType.EQ => "==",
             TokType.NEQ => "!=",
             TokType.LT => "<",
             TokType.GT => ">",
             TokType.LEQ => "<=",
             TokType.GEQ => ">=",
+
             TokType.PLUS => "+",
             TokType.MINUS => "-",
             TokType.MUL => "*",
             TokType.DIV => "/",
             TokType.MOD => "%",
             TokType.POW => "**",
+
             TokType.BITAND => "&",
             TokType.BITXOR => "^",
             TokType.BITOR => "|",
             TokType.AND => "&&",
             TokType.OR => "||",
+
             TokType.INC => "++",
             TokType.DEC => "--",
+
             TokType.BITNOT => "~",
             TokType.BANG => "!",
+
             _ => "?"
         };
     }
@@ -236,13 +229,16 @@ namespace MiniJs
                     "in" => new Token(TokType.IN, s, pos),
                     "break" => new Token(TokType.BREAK, s, pos),
                     "continue" => new Token(TokType.CONTINUE, s, pos),
+
                     "import" => new Token(TokType.IMPORT, s, pos),
                     "as" => new Token(TokType.AS, s, pos),
+
                     "task" => new Token(TokType.TASK, s, pos),
                     "yield" => new Token(TokType.YIELD, s, pos),
                     "lock" => new Token(TokType.LOCK, s, pos),
                     "await" => new Token(TokType.AWAIT, s, pos),
                     "join" => new Token(TokType.JOIN, s, pos),
+
                     "true" => new Token(TokType.TRUE_TOK, s, pos),
                     "false" => new Token(TokType.FALSE_TOK, s, pos),
                     "null" => new Token(TokType.NULL_TOK, s, pos),
@@ -277,6 +273,7 @@ namespace MiniJs
                         {
                             'n' => '\n',
                             't' => '\t',
+                            'r' => '\r',
                             '"' => '"',
                             '\\' => '\\',
                             _ => e
@@ -369,7 +366,6 @@ namespace MiniJs
 
         TaskExpr,
         AwaitExpr,
-
         TaskBlock
     }
 
@@ -442,14 +438,29 @@ namespace MiniJs
             return s;
         }
 
-        private Node TaskBlockExpr(Token taskTok)
+        private Node ImportStmt()
         {
-            Consume(TokType.LBRACE, "'{' after task");
-            var b = new Node(NodeType.TaskBlock, taskTok);
-            while (_cur.Type != TokType.RBRACE && _cur.Type != TokType.EOF_TOK)
-                b.Kids.Add(Statement());
-            Consume(TokType.RBRACE, "'}' after task block");
-            return b;
+            Token it = Consume(TokType.IMPORT, "'import'");
+
+            Token first = Consume(TokType.IDENT, "import name");
+            var full = new StringBuilder(first.Lexeme);
+            while (Match(TokType.DOT))
+            {
+                Token part = Consume(TokType.IDENT, "import name part");
+                full.Append('.').Append(part.Lexeme);
+            }
+
+            Token aliasTok;
+            if (Match(TokType.AS))
+                aliasTok = Consume(TokType.IDENT, "alias after 'as'");
+            else
+                aliasTok = new Token(TokType.IDENT, full.ToString().Split('.').Last(), it.Pos);
+
+            Match(TokType.SEMI);
+
+            var n = new Node(NodeType.ImportStmt, aliasTok);
+            n.Text = full.ToString();
+            return n;
         }
 
         private Node TaskStmt()
@@ -466,16 +477,14 @@ namespace MiniJs
             return n;
         }
 
-        private Node AwaitStmt()
+        private Node TaskBlockExpr(Token taskTok)
         {
-            Token at = _cur;
-            if (_cur.Type == TokType.AWAIT) Consume(TokType.AWAIT, "'await'");
-            else Consume(TokType.JOIN, "'join'");
-            var expr = Expression();
-            Match(TokType.SEMI);
-            var n = new Node(NodeType.AwaitStmt, at);
-            n.Kids.Add(expr);
-            return n;
+            Consume(TokType.LBRACE, "'{' after task");
+            var b = new Node(NodeType.TaskBlock, taskTok);
+            while (_cur.Type != TokType.RBRACE && _cur.Type != TokType.EOF_TOK)
+                b.Kids.Add(Statement());
+            Consume(TokType.RBRACE, "'}' after task block");
+            return b;
         }
 
         private Node YieldStmt()
@@ -499,28 +508,15 @@ namespace MiniJs
             return n;
         }
 
-        private Node ImportStmt()
+        private Node AwaitStmt()
         {
-            Token it = Consume(TokType.IMPORT, "'import'");
-
-            Token first = Consume(TokType.IDENT, "import name");
-            var full = new StringBuilder(first.Lexeme);
-            while (Match(TokType.DOT))
-            {
-                Token part = Consume(TokType.IDENT, "import name part");
-                full.Append('.').Append(part.Lexeme);
-            }
-
-            Token aliasTok;
-            if (Match(TokType.AS))
-                aliasTok = Consume(TokType.IDENT, "alias after 'as'");
-            else
-                aliasTok = new Token(TokType.IDENT, full.ToString().Split('.').Last(), it.Pos);
-
+            Token at = _cur;
+            if (_cur.Type == TokType.AWAIT) Consume(TokType.AWAIT, "'await'");
+            else Consume(TokType.JOIN, "'join'");
+            var expr = Expression();
             Match(TokType.SEMI);
-
-            var n = new Node(NodeType.ImportStmt, aliasTok);
-            n.Text = full.ToString();
+            var n = new Node(NodeType.AwaitStmt, at);
+            n.Kids.Add(expr);
             return n;
         }
 
@@ -921,10 +917,8 @@ namespace MiniJs
             {
                 Token tt = Consume(TokType.TASK, "'task'");
                 var u = new Node(NodeType.TaskExpr, tt);
-
                 if (_cur.Type == TokType.LBRACE) u.Kids.Add(TaskBlockExpr(tt));
                 else u.Kids.Add(Unary());
-
                 return u;
             }
 
@@ -946,7 +940,6 @@ namespace MiniJs
                 u.Kids.Add(Unary());
                 return u;
             }
-
             return Postfix();
         }
 
@@ -980,7 +973,7 @@ namespace MiniJs
                 if (_cur.Type == TokType.LPAREN)
                 {
                     Token ct = Consume(TokType.LPAREN, "'('");
-                    var args = new Node(NodeType.Block, ct);
+                    var args = new Node(NodeType.Block, ct); // arg-list holder
                     if (_cur.Type != TokType.RPAREN)
                     {
                         args.Kids.Add(Expression());
@@ -1039,7 +1032,7 @@ namespace MiniJs
 
             if (Match(TokType.NEW))
             {
-                Token first = Consume(TokType.IDENT, "type name after new");
+                Token first = Consume(TokType.IDENT, "type/class name after new");
                 var full = new StringBuilder(first.Lexeme);
                 while (Match(TokType.DOT))
                 {
@@ -1047,7 +1040,7 @@ namespace MiniJs
                     full.Append('.').Append(part.Lexeme);
                 }
 
-                Consume(TokType.LPAREN, "'(' after new Type");
+                Consume(TokType.LPAREN, "'(' after new X");
                 var args = new Node(NodeType.Block);
                 if (_cur.Type != TokType.RPAREN)
                 {
@@ -1100,7 +1093,7 @@ namespace MiniJs
                         obj.Kids.Add(val);
 
                         if (!Match(TokType.COMMA)) break;
-                        if (_cur.Type == TokType.RBRACE) break;
+                        if (_cur.Type == TokType.RBRACE) break; // trailing comma
                     }
                 }
 
@@ -1138,16 +1131,223 @@ namespace MiniJs
         }
     }
 
-    // ---------------- Task Manager (queue + limit) ----------------
+    // ---------------- Script runtime types ----------------
+
+    sealed class JsArray { public List<object?> Items = new(); }
+
+    sealed class JsObject
+    {
+        public Dictionary<string, object?> Props = new();
+        public List<string> Order = new();
+        public ClassDef? Klass;
+    }
+
+    sealed class Env
+    {
+        private readonly object _lock = new();
+        public Env? Parent;
+        public Dictionary<string, object?> Vars = new();
+
+        public Env(Env? p = null) { Parent = p; }
+
+        public object? Get(string k)
+        {
+            lock (_lock)
+            {
+                if (Vars.TryGetValue(k, out var v)) return v;
+            }
+            if (Parent != null) return Parent.Get(k);
+            throw new Exception("ReferenceError: " + k + " is not defined");
+        }
+
+        public bool TryGetHere(string k, out object? v)
+        {
+            lock (_lock) return Vars.TryGetValue(k, out v);
+        }
+
+        public bool ContainsHere(string k)
+        {
+            lock (_lock) return Vars.ContainsKey(k);
+        }
+
+        public void Set(string k, object? v)
+        {
+            lock (_lock)
+            {
+                if (Vars.ContainsKey(k)) { Vars[k] = v; return; }
+            }
+            if (Parent != null) { Parent.Set(k, v); return; }
+            lock (_lock) Vars[k] = v;
+        }
+
+        public void Declare(string k, object? v)
+        {
+            lock (_lock) Vars[k] = v;
+        }
+    }
+
+    sealed class Function
+    {
+        public List<string> Params = new();
+        public Node? Body;            // Block node
+        public Env? Closure;
+        public bool IsNative = false;
+        public Func<List<object?>, object?, object?>? Native;
+    }
+
+    sealed class ClassDef
+    {
+        public string Name = "";
+        public Dictionary<string, Function> Methods = new();           // includes "constructor"
+        public List<(string name, Node? initExpr)> Fields = new();     // (name, initExpr)
+        public Env? Closure;                                           // for field init eval
+    }
+
+    sealed class ReturnSignal : Exception { public object? Value; public ReturnSignal(object? v) { Value = v; } }
+    sealed class BreakSignal : Exception { }
+    sealed class ContinueSignal : Exception { }
+
+    sealed class ClrNamespace
+    {
+        public string Name;
+        public ClrNamespace(string n) { Name = n; }
+        public override string ToString() => $"[namespace {Name}]";
+    }
+
+    sealed class ClrCallable
+    {
+        public object? Target; // instance or Type
+        public string Name;
+        public ClrCallable(object? target, string name) { Target = target; Name = name; }
+        public override string ToString() => "[clr-callable]";
+    }
+
+    sealed class JsTask
+    {
+        private readonly Task<object?> _task;
+
+        public JsTask(Task<object?> task) { _task = task; }
+        public bool Done => _task.IsCompleted;
+        public string Status => _task.Status.ToString();
+        public object? Result => _task.IsCompletedSuccessfully ? _task.Result : null;
+        public object? Wait() => _task.GetAwaiter().GetResult();
+        internal Task<object?> Task => _task;
+        public override string ToString() => "[task]";
+    }
+
+    // ---------------- Helpers ----------------
+
+    static class Rt
+    {
+        public static bool IsTruthy(object? v) => v switch
+        {
+            null => false,
+            bool b => b,
+            double d => d != 0.0,
+            float f => f != 0.0f,
+            int i => i != 0,
+            long l => l != 0,
+            string s => !string.IsNullOrEmpty(s),
+            _ => true
+        };
+
+        public static string ToJsString(object? v)
+        {
+            if (v is null) return "null";
+            if (v is bool b) return b ? "true" : "false";
+            if (v is string s) return s;
+
+            if (v is double d) return d.ToString(CultureInfo.InvariantCulture);
+            if (v is float f) return f.ToString(CultureInfo.InvariantCulture);
+            if (v is int i) return i.ToString(CultureInfo.InvariantCulture);
+            if (v is long l) return l.ToString(CultureInfo.InvariantCulture);
+
+            if (v is Enum en) return en.ToString();
+
+            if (v is JsArray a)
+            {
+                List<object?> snap;
+                lock (a) snap = a.Items.ToList();
+                return "[" + string.Join(", ", snap.Select(ToJsString)) + "]";
+            }
+
+            if (v is JsObject o)
+            {
+                List<string> keys;
+                Dictionary<string, object?> propsSnap;
+                lock (o)
+                {
+                    keys = (o.Order.Count > 0 ? o.Order : o.Props.Keys.ToList()).ToList();
+                    propsSnap = new Dictionary<string, object?>(o.Props);
+                }
+                var parts = new List<string>();
+                foreach (var k in keys)
+                {
+                    if (!propsSnap.TryGetValue(k, out var vv)) continue;
+                    parts.Add(k + ": " + ToJsString(vv));
+                }
+                return "{" + string.Join(", ", parts) + "}";
+            }
+
+            if (v is Function) return "[function]";
+            if (v is ClassDef) return "[class]";
+            if (v is ClrNamespace ns) return ns.ToString();
+            if (v is Type t) return $"[type {t.FullName}]";
+            if (v is ClrCallable) return "[clr-callable]";
+            if (v is JsTask) return "[task]";
+
+            return v.ToString() ?? "";
+        }
+
+        public static bool IsNumeric(object? v) =>
+            v is byte or sbyte or short or ushort or int or uint or long or ulong or float or double or decimal;
+
+        public static double ToNumber(object? v)
+        {
+            try
+            {
+                return v switch
+                {
+                    null => 0.0,
+                    double d => d,
+                    float f => f,
+                    decimal m => (double)m,
+                    int i => i,
+                    long l => l,
+                    bool b => b ? 1.0 : 0.0,
+                    string s => string.IsNullOrEmpty(s) ? 0.0 : double.Parse(s, CultureInfo.InvariantCulture),
+                    Enum e => Convert.ToDouble(e, CultureInfo.InvariantCulture),
+                    _ => double.Parse(ToJsString(v), CultureInfo.InvariantCulture)
+                };
+            }
+            catch
+            {
+                throw;
+            }
+        }
+
+        public static int ToInt32(object? v)
+        {
+            double d = ToNumber(v);
+            if (double.IsNaN(d) || double.IsInfinity(d) || d == 0.0) return 0;
+            double two32 = 4294967296.0;
+            double n = d >= 0 ? Math.Floor(d) : Math.Ceiling(d);
+            n = n % two32;
+            if (n < 0) n += two32;
+            uint u = (uint)n;
+            return unchecked((int)u);
+        }
+    }
+
+    // ---------------- Task manager (queue + limit) ----------------
 
     sealed class TaskManager
     {
         private readonly object _cfgLock = new();
-
         private SemaphoreSlim _sem;
         private int _maxConcurrency;
         private int _queueLimit;
-        private int _queued; // pending + running
+        private int _queued;
 
         public TaskManager(int maxConcurrency, int queueLimit)
         {
@@ -1166,8 +1366,6 @@ namespace MiniJs
             lock (_cfgLock)
             {
                 if (n == _maxConcurrency) return;
-
-                // Replace semaphore for future tasks; existing waits continue on old instance
                 _maxConcurrency = n;
                 _sem = new SemaphoreSlim(_maxConcurrency, _maxConcurrency);
             }
@@ -1208,193 +1406,33 @@ namespace MiniJs
         }
     }
 
-    // ---------------- runtime objects ----------------
+    // ---------------- AST dump (optional) ----------------
 
-    sealed class JsArray { public List<object?> Items = new(); }
-
-    sealed class JsObject
+    static class AstDump
     {
-        public Dictionary<string, object?> Props = new();
-        public List<string> Order = new();
-        public ClassDef? Klass;
-    }
-
-    sealed class Env
-    {
-        private readonly object _lock = new();
-        public Env? Parent;
-        public Dictionary<string, object?> Vars = new();
-
-        public Env(Env? p = null) { Parent = p; }
-
-        public object? Get(string k)
+        public static void Dump(Node? n, int indent = 0)
         {
-            lock (_lock)
+            if (n == null)
             {
-                if (Vars.TryGetValue(k, out var v)) return v;
-            }
-            if (Parent != null) return Parent.Get(k);
-            throw new Exception("ReferenceError: " + k + " is not defined");
-        }
-
-        public void Set(string k, object? v)
-        {
-            lock (_lock)
-            {
-                if (Vars.ContainsKey(k)) { Vars[k] = v; return; }
-            }
-            if (Parent != null) { Parent.Set(k, v); return; }
-            lock (_lock) Vars[k] = v;
-        }
-
-        public void Declare(string k, object? v)
-        {
-            lock (_lock) Vars[k] = v;
-        }
-    }
-
-    sealed class Function
-    {
-        public List<string> Params = new();
-        public Node? Body;
-        public Env? Closure;
-        public bool IsNative = false;
-        public Func<List<object?>, object?, object?>? Native;
-    }
-
-    sealed class ClassDef
-    {
-        public string Name = "";
-        public Dictionary<string, Function> Methods = new();
-        public List<(string name, Node? initExpr)> Fields = new();
-        public Env? Closure;
-    }
-
-    sealed class ClrNamespace
-    {
-        public string Name;
-        public ClrNamespace(string n) { Name = n; }
-        public override string ToString() => $"[namespace {Name}]";
-    }
-
-    sealed class ClrCallable
-    {
-        public object? Target; // instance or Type for static
-        public string Name;
-        public ClrCallable(object? target, string name) { Target = target; Name = name; }
-        public override string ToString() => "[clr-callable]";
-    }
-
-    sealed class ReturnSignal : Exception { public object? Value; public ReturnSignal(object? v) { Value = v; } }
-    sealed class BreakSignal : Exception { }
-    sealed class ContinueSignal : Exception { }
-
-    static class Rt
-    {
-        public static bool IsTruthy(object? v) => v switch
-        {
-            null => false,
-            bool b => b,
-            double d => d != 0.0,
-            float f => f != 0.0f,
-            int i => i != 0,
-            long l => l != 0,
-            string s => !string.IsNullOrEmpty(s),
-            _ => true
-        };
-
-        public static string ToJsString(object? v)
-        {
-            if (v is null) return "null";
-            if (v is bool b) return b ? "true" : "false";
-            if (v is string s) return s;
-
-            if (v is double d) return d.ToString(CultureInfo.InvariantCulture);
-            if (v is float f) return f.ToString(CultureInfo.InvariantCulture);
-            if (v is int i) return i.ToString(CultureInfo.InvariantCulture);
-            if (v is long l) return l.ToString(CultureInfo.InvariantCulture);
-
-            if (v is JsArray a)
-            {
-                List<object?> snap;
-                lock (a) snap = a.Items.ToList();
-                return "[" + string.Join(", ", snap.Select(ToJsString)) + "]";
+                Console.WriteLine(new string(' ', indent) + "(null)");
+                return;
             }
 
-            if (v is JsObject o)
-            {
-                List<string> keys;
-                Dictionary<string, object?> propsSnap;
-                lock (o)
-                {
-                    keys = (o.Order.Count > 0 ? o.Order : o.Props.Keys.ToList()).ToList();
-                    propsSnap = new Dictionary<string, object?>(o.Props);
-                }
+            string pad = new string(' ', indent);
+            Console.Write(pad + n.Type);
 
-                var parts = new List<string>();
-                foreach (var k in keys)
-                {
-                    if (!propsSnap.TryGetValue(k, out var vv)) continue;
-                    parts.Add(k + ": " + ToJsString(vv));
-                }
-                return "{" + string.Join(", ", parts) + "}";
-            }
+            if (n.Tok.Type != TokType.EOF_TOK || !string.IsNullOrEmpty(n.Tok.Lexeme))
+                Console.Write($"  tok={Tok.Name(n.Tok.Type)} '{n.Tok.Lexeme}' @{n.Tok.Pos}");
 
-            if (v is Function) return "[function]";
-            if (v is ClassDef) return "[class]";
-            if (v is ClrNamespace ns) return ns.ToString();
-            if (v is Type t) return $"[type {t.FullName}]";
-            if (v is ClrCallable) return "[clr-callable]";
-            if (v is JsTask) return "[task]";
+            if (!string.IsNullOrEmpty(n.Text))
+                Console.Write($"  text='{n.Text}'");
 
-            return v.ToString() ?? "";
-        }
-
-        public static double ToNumber(object? v)
-        {
-            return v switch
-            {
-                null => 0.0,
-                double d => d,
-                float f => f,
-                int i => i,
-                long l => l,
-                bool b => b ? 1.0 : 0.0,
-                string s => string.IsNullOrEmpty(s) ? 0.0 : double.Parse(s, CultureInfo.InvariantCulture),
-                _ => double.Parse(ToJsString(v), CultureInfo.InvariantCulture)
-            };
-        }
-
-        public static int ToInt32(object? v)
-        {
-            double d = ToNumber(v);
-            if (double.IsNaN(d) || double.IsInfinity(d) || d == 0.0) return 0;
-            double two32 = 4294967296.0;
-            double n = d >= 0 ? Math.Floor(d) : Math.Ceiling(d);
-            n = n % two32;
-            if (n < 0) n += two32;
-            uint u = (uint)n;
-            return unchecked((int)u);
+            Console.WriteLine();
+            foreach (var k in n.Kids) Dump(k, indent + 2);
         }
     }
 
-    sealed class JsTask
-    {
-        private readonly Task<object?> _task;
-
-        public JsTask(Task<object?> task) { _task = task; }
-
-        public bool Done => _task.IsCompleted;
-        public bool IsCompleted => _task.IsCompleted;
-        public bool IsFaulted => _task.IsFaulted;
-        public string Status => _task.Status.ToString();
-
-        public object? Result => (_task.IsCompletedSuccessfully) ? _task.Result : null;
-
-        public object? Wait() => _task.GetAwaiter().GetResult();
-
-        internal Task<object?> Task => _task;
-    }
+    // ---------------- Interpreter ----------------
 
     readonly struct EventKey
     {
@@ -1416,23 +1454,22 @@ namespace MiniJs
     {
         public Env Global;
 
-        private readonly Dictionary<EventKey, List<Delegate>> _eventSubs = new(new EventKeyComparer());
+        private readonly TaskManager _taskMgr;
 
         private readonly object _namedLocksGuard = new();
         private readonly Dictionary<string, object> _namedLocks = new(StringComparer.Ordinal);
 
-        private readonly TaskManager _taskMgr;
+        private readonly object _eventSubsGuard = new();
+        private readonly Dictionary<EventKey, List<Delegate>> _eventSubs = new(new EventKeyComparer());
+
+        private readonly Dictionary<string, Type?> _typeCache = new(StringComparer.Ordinal);
 
         public Interpreter()
         {
             Global = new Env();
+            _taskMgr = new TaskManager(Math.Max(1, Environment.ProcessorCount), 5000);
 
-            // default: CPU-count parallel, queue cap 5000
-            _taskMgr = new TaskManager(
-                maxConcurrency: Math.Max(1, Environment.ProcessorCount),
-                queueLimit: 5000
-            );
-
+            // builtin print(...)
             var pf = new Function
             {
                 IsNative = true,
@@ -1449,9 +1486,10 @@ namespace MiniJs
             };
             Global.Declare("print", pf);
 
+            // root namespace
             Global.Declare("System", new ClrNamespace("System"));
 
-            // task control builtins
+            // task tuning
             Global.Declare("setTaskLimit", new Function
             {
                 IsNative = true,
@@ -1482,19 +1520,85 @@ namespace MiniJs
                     var o = new JsObject();
                     lock (o)
                     {
-                        o.Order.Add("MaxConcurrency");
-                        o.Props["MaxConcurrency"] = (double)_taskMgr.MaxConcurrency;
-
-                        o.Order.Add("QueueLimit");
-                        o.Props["QueueLimit"] = (double)_taskMgr.QueueLimit;
-
-                        o.Order.Add("Queued");
-                        o.Props["Queued"] = (double)_taskMgr.Queued;
+                        o.Order.Add("MaxConcurrency"); o.Props["MaxConcurrency"] = (double)_taskMgr.MaxConcurrency;
+                        o.Order.Add("QueueLimit"); o.Props["QueueLimit"] = (double)_taskMgr.QueueLimit;
+                        o.Order.Add("Queued"); o.Props["Queued"] = (double)_taskMgr.Queued;
                     }
                     return o;
                 }
             });
+
+            // UI marshal helpers
+            Global.Declare("ui", new Function
+            {
+                IsNative = true,
+                Native = (args, _) =>
+                {
+                    if (args.Count < 2) throw new Exception("TypeError: ui(control, fn) expects 2 args");
+                    object? target = args[0];
+                    object? fnObj = args[1];
+
+                    object? Run()
+                    {
+                        if (fnObj is Function f) return CallFunction(f, new List<object?>(), target);
+                        if (fnObj is Delegate d) return d.DynamicInvoke();
+                        throw new Exception("TypeError: ui(control, fn) fn must be a function");
+                    }
+
+                    if (target is Control c)
+                    {
+                        try { if (!c.IsHandleCreated) _ = c.Handle; } catch { }
+                        if (c.InvokeRequired) return c.Invoke(new Func<object?>(Run));
+                        return Run();
+                    }
+
+                    if (target is ISynchronizeInvoke sync)
+                    {
+                        if (sync.InvokeRequired) return sync.Invoke(new Func<object?>(Run), Array.Empty<object>());
+                        return Run();
+                    }
+
+                    throw new Exception("TypeError: ui(control, fn) requires WinForms Control (or ISynchronizeInvoke)");
+                }
+            });
+
+            Global.Declare("uiAsync", new Function
+            {
+                IsNative = true,
+                Native = (args, _) =>
+                {
+                    if (args.Count < 2) throw new Exception("TypeError: uiAsync(control, fn) expects 2 args");
+                    object? target = args[0];
+                    object? fnObj = args[1];
+
+                    void Run()
+                    {
+                        if (fnObj is Function f) { CallFunction(f, new List<object?>(), target); return; }
+                        if (fnObj is Delegate d) { d.DynamicInvoke(); return; }
+                        throw new Exception("TypeError: uiAsync(control, fn) fn must be a function");
+                    }
+
+                    if (target is Control c)
+                    {
+                        try { if (!c.IsHandleCreated) _ = c.Handle; } catch { }
+                        if (c.InvokeRequired) return c.BeginInvoke(new System.Windows.Forms.MethodInvoker(Run));
+                        Run();
+                        return null;
+                    }
+
+                    if (target is ISynchronizeInvoke sync)
+                    {
+                        if (sync.InvokeRequired) return sync.BeginInvoke(new System.Windows.Forms.MethodInvoker(Run), Array.Empty<object>());
+                        Run();
+                        return null;
+                    }
+
+                    throw new Exception("TypeError: uiAsync(control, fn) requires WinForms Control (or ISynchronizeInvoke)");
+                }
+            });
         }
+
+        // ---------------- Script function call ----------------
 
         public object? CallFunction(Function fn, List<object?> args, object? thisVal)
         {
@@ -1519,709 +1623,364 @@ namespace MiniJs
             }
         }
 
-        private object? BinaryPlus(object? l, object? r)
-        {
-            if (l is string || r is string)
-                return Rt.ToJsString(l) + Rt.ToJsString(r);
-            return Rt.ToNumber(l) + Rt.ToNumber(r);
-        }
+        // ---------------- CLR type resolution ----------------
 
-        private static bool EqualsForRuntime(object? a, object? b)
+        private Type? ResolveClrType(string fullName)
         {
-            if (a is null && b is null) return true;
-            if (a is null || b is null) return false;
-            if (a.GetType() != b.GetType()) return false;
-            return a.Equals(b);
-        }
-
-        // ---------------- CLR helpers ----------------
-
-        private static Type? ResolveClrType(string fullName)
-        {
-            static Type? FindType(string name)
+            lock (_typeCache)
             {
-                var t0 = Type.GetType(name, throwOnError: false, ignoreCase: false);
-                if (t0 != null) return t0;
+                if (_typeCache.TryGetValue(fullName, out var cached)) return cached;
+            }
 
+            Type? found = null;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                found = asm.GetType(fullName, throwOnError: false, ignoreCase: false);
+                if (found != null) break;
+            }
+
+            // small helper: allow "System.Collections.Generic.List" -> List`1<object>
+            if (found == null)
+            {
+                string gen1 = fullName + "`1";
+                Type? gdef = null;
                 foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
                 {
-                    try
-                    {
-                        var t = asm.GetType(name, throwOnError: false, ignoreCase: false);
-                        if (t != null) return t;
-                    }
-                    catch { }
+                    gdef = asm.GetType(gen1, false, false);
+                    if (gdef != null) break;
                 }
-                return null;
-            }
-
-            fullName = fullName switch
-            {
-                "System.Collections.Generic.ArrayList" => "System.Collections.ArrayList",
-                _ => fullName
-            };
-
-            var t1 = FindType(fullName);
-            if (t1 != null) return t1;
-
-            for (int arity = 1; arity <= 4; arity++)
-            {
-                var open = FindType(fullName + "`" + arity);
-                if (open != null && open.IsGenericTypeDefinition)
+                if (gdef != null && gdef.IsGenericTypeDefinition && gdef.GetGenericArguments().Length == 1)
                 {
-                    var args = Enumerable.Repeat(typeof(object), arity).ToArray();
-                    return open.MakeGenericType(args);
+                    try { found = gdef.MakeGenericType(typeof(object)); } catch { }
                 }
             }
 
+            lock (_typeCache) _typeCache[fullName] = found;
+            return found;
+        }
+
+        // ---------------- Reflection member resolution (fixes ambiguous Controls) ----------------
+
+        private static PropertyInfo? GetMostDerivedProperty(Type t, string name, bool isStatic)
+        {
+            var flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static;
+            if (isStatic) flags = BindingFlags.Public | BindingFlags.Static;
+            else flags = BindingFlags.Public | BindingFlags.Instance;
+
+            for (Type? cur = t; cur != null; cur = cur.BaseType)
+            {
+                var props = cur.GetProperties(flags | BindingFlags.DeclaredOnly)
+                               .Where(p => p.Name == name)
+                               .ToArray();
+                if (props.Length > 0) return props[0];
+            }
             return null;
         }
 
-        private static bool IsNullableOrRef(Type t) => !t.IsValueType || Nullable.GetUnderlyingType(t) != null;
-
-        private static bool IsNumericType(Type t)
+        private static FieldInfo? GetMostDerivedField(Type t, string name, bool isStatic)
         {
-            t = Nullable.GetUnderlyingType(t) ?? t;
-            return t == typeof(byte) || t == typeof(sbyte) ||
-                   t == typeof(short) || t == typeof(ushort) ||
-                   t == typeof(int) || t == typeof(uint) ||
-                   t == typeof(long) || t == typeof(ulong) ||
-                   t == typeof(float) || t == typeof(double) ||
-                   t == typeof(decimal);
+            var flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static;
+            if (isStatic) flags = BindingFlags.Public | BindingFlags.Static;
+            else flags = BindingFlags.Public | BindingFlags.Instance;
+
+            for (Type? cur = t; cur != null; cur = cur.BaseType)
+            {
+                var fld = cur.GetField(name, flags | BindingFlags.DeclaredOnly);
+                if (fld != null) return fld;
+            }
+            return null;
         }
 
-        private static object? ConvertArg(object? arg, Type targetType)
+        private static EventInfo? GetMostDerivedEvent(Type t, string name, bool isStatic)
         {
+            var flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static;
+            if (isStatic) flags = BindingFlags.Public | BindingFlags.Static;
+            else flags = BindingFlags.Public | BindingFlags.Instance;
+
+            for (Type? cur = t; cur != null; cur = cur.BaseType)
+            {
+                var evs = cur.GetEvents(flags | BindingFlags.DeclaredOnly)
+                             .Where(e => e.Name == name)
+                             .ToArray();
+                if (evs.Length > 0) return evs[0];
+            }
+            return null;
+        }
+
+        private static MethodInfo[] GetAllMethods(Type t, string name, bool isStatic)
+        {
+            var flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static;
+            if (isStatic) flags = BindingFlags.Public | BindingFlags.Static;
+            else flags = BindingFlags.Public | BindingFlags.Instance;
+
+            return t.GetMethods(flags).Where(m => m.Name == name).ToArray();
+        }
+
+        // ---------------- Conversions / overload resolution ----------------
+
+        private static bool IsNullableType(Type t) =>
+            t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Nullable<>);
+
+        private object? ConvertArg(object? arg, Type targetType)
+        {
+            if (targetType == typeof(object)) return arg;
+
             if (arg == null)
             {
-                if (!IsNullableOrRef(targetType))
-                    throw new Exception($"TypeError: cannot pass null to {targetType.Name}");
-                return null;
+                if (!targetType.IsValueType || IsNullableType(targetType)) return null;
+                throw new Exception($"TypeError: cannot convert null to {targetType.Name}");
             }
 
-            var nn = Nullable.GetUnderlyingType(targetType) ?? targetType;
+            var argType = arg.GetType();
+            if (targetType.IsAssignableFrom(argType)) return arg;
 
-            if (nn == typeof(object)) return arg;
-            if (nn.IsInstanceOfType(arg)) return arg;
-
-            if (arg is double d)
+            if (targetType.IsEnum)
             {
-                if (nn == typeof(double)) return d;
-                if (nn == typeof(float)) return (float)d;
-                if (nn == typeof(decimal)) return (decimal)d;
-                if (nn == typeof(int)) return (int)d;
-                if (nn == typeof(long)) return (long)d;
-                if (nn == typeof(short)) return (short)d;
-                if (nn == typeof(byte)) return (byte)d;
-                if (nn == typeof(uint)) return (uint)d;
-                if (nn == typeof(ulong)) return (ulong)d;
-                if (nn == typeof(bool)) return d != 0.0;
+                if (arg is string s) return Enum.Parse(targetType, s, ignoreCase: true);
+                if (Rt.IsNumeric(arg)) return Enum.ToObject(targetType, Convert.ChangeType(arg, Enum.GetUnderlyingType(targetType), CultureInfo.InvariantCulture)!);
             }
 
-            if (nn == typeof(string)) return Rt.ToJsString(arg);
-
-            if (nn.IsEnum)
+            // Function -> Delegate
+            if (typeof(Delegate).IsAssignableFrom(targetType) && arg is Function fn)
             {
-                if (arg is string es) return Enum.Parse(nn, es, ignoreCase: true);
-                if (arg is double ed) return Enum.ToObject(nn, (int)ed);
+                return CreateDelegateFromFunction(targetType, fn, thisValForCall: null);
             }
+
+            // numbers
+            if (targetType == typeof(int)) return (int)Rt.ToNumber(arg);
+            if (targetType == typeof(long)) return (long)Rt.ToNumber(arg);
+            if (targetType == typeof(float)) return (float)Rt.ToNumber(arg);
+            if (targetType == typeof(double)) return Rt.ToNumber(arg);
+            if (targetType == typeof(bool)) return Rt.IsTruthy(arg);
+            if (targetType == typeof(string)) return Rt.ToJsString(arg);
 
             try
             {
-                return Convert.ChangeType(arg, nn, CultureInfo.InvariantCulture);
-            }
-            catch
-            {
-                if (arg is string s && IsNumericType(nn))
+                if (arg is IConvertible && typeof(IConvertible).IsAssignableFrom(targetType))
+                    return Convert.ChangeType(arg, targetType, CultureInfo.InvariantCulture);
+
+                // string -> type via TypeConverter
+                if (arg is string str)
                 {
-                    if (nn == typeof(double)) return double.Parse(s, CultureInfo.InvariantCulture);
-                    if (nn == typeof(int)) return int.Parse(s, CultureInfo.InvariantCulture);
-                    if (nn == typeof(long)) return long.Parse(s, CultureInfo.InvariantCulture);
+                    var conv = TypeDescriptor.GetConverter(targetType);
+                    if (conv != null && conv.CanConvertFrom(typeof(string)))
+                        return conv.ConvertFromInvariantString(str);
                 }
-                throw new Exception($"TypeError: cannot convert '{Rt.ToJsString(arg)}' to {targetType.Name}");
             }
+            catch { }
+
+            throw new Exception($"TypeError: cannot convert {argType.Name} to {targetType.Name}");
         }
 
-        private static int ScoreArg(object? arg, Type paramType)
+        private sealed class Candidate
         {
-            if (arg == null) return IsNullableOrRef(paramType) ? 2 : int.MaxValue;
-
-            var nn = Nullable.GetUnderlyingType(paramType) ?? paramType;
-            if (nn.IsInstanceOfType(arg)) return 0;
-
-            if (arg is double && IsNumericType(nn)) return 3;
-            if (arg is string && nn == typeof(string)) return 0;
-
-            try { ConvertArg(arg, paramType); return 6; }
-            catch { return int.MaxValue; }
+            public MethodBase M;
+            public int Score;
+            public object?[] FinalArgs;
+            public Candidate(MethodBase m, int score, object?[] finalArgs) { M = m; Score = score; FinalArgs = finalArgs; }
         }
 
-        private static bool HasParamArray(ParameterInfo[] ps) =>
-            ps.Length > 0 && ps[^1].IsDefined(typeof(ParamArrayAttribute), inherit: false);
-
-        private static object?[] PrepareInvokeArgs(ParameterInfo[] ps, IList<object?> args)
+        private MethodBase SelectBestOverload(IEnumerable<MethodBase> methods, List<object?> args, out object?[] finalArgs)
         {
-            bool hasParams = HasParamArray(ps);
+            Candidate? best = null;
 
-            if (!hasParams)
+            foreach (var mb in methods)
             {
-                if (args.Count > ps.Length) throw new Exception("TypeError: too many arguments");
+                var ps = mb.GetParameters();
+                bool hasParams = ps.Length > 0 && ps[^1].GetCustomAttributes(typeof(ParamArrayAttribute), false).Any();
 
-                var conv = new object?[ps.Length];
-
-                for (int i = 0; i < args.Count; i++)
-                    conv[i] = ConvertArg(args[i], ps[i].ParameterType);
-
-                for (int i = args.Count; i < ps.Length; i++)
+                int minCount = 0;
+                for (int i = 0; i < ps.Length; i++)
                 {
-                    if (!ps[i].IsOptional)
-                        throw new Exception("TypeError: not enough arguments");
-                    conv[i] = Type.Missing;
+                    if (hasParams && i == ps.Length - 1) break;
+                    if (!ps[i].IsOptional) minCount++;
                 }
-
-                return conv;
-            }
-
-            int fixedCount = ps.Length - 1;
-            if (args.Count < fixedCount) throw new Exception("TypeError: not enough arguments");
-
-            var res = new object?[ps.Length];
-
-            for (int i = 0; i < fixedCount; i++)
-                res[i] = ConvertArg(args[i], ps[i].ParameterType);
-
-            var arrParamType = ps[^1].ParameterType;
-            var elemType = arrParamType.GetElementType() ?? typeof(object);
-
-            if (args.Count == ps.Length && args[^1] != null && arrParamType.IsInstanceOfType(args[^1]))
-            {
-                res[^1] = args[^1];
-                return res;
-            }
-
-            int varCount = args.Count - fixedCount;
-            Array packed = Array.CreateInstance(elemType, varCount);
-
-            for (int j = 0; j < varCount; j++)
-                packed.SetValue(ConvertArg(args[fixedCount + j], elemType), j);
-
-            res[^1] = packed;
-            return res;
-        }
-
-        private static MethodInfo SelectBestMethod(IEnumerable<MethodInfo> methods, IList<object?> args)
-        {
-            MethodInfo? best = null;
-            int bestScore = int.MaxValue;
-
-            foreach (var m in methods)
-            {
-                var ps = m.GetParameters();
-                bool hasParams = HasParamArray(ps);
 
                 if (!hasParams)
                 {
+                    if (args.Count < minCount) continue;
                     if (args.Count > ps.Length) continue;
-
-                    bool ok = true;
-                    for (int i = args.Count; i < ps.Length; i++)
-                        if (!ps[i].IsOptional) { ok = false; break; }
-                    if (!ok) continue;
-
-                    int score = 0;
-                    for (int i = 0; i < args.Count; i++)
-                    {
-                        int s = ScoreArg(args[i], ps[i].ParameterType);
-                        if (s == int.MaxValue) { ok = false; break; }
-                        score += s;
-                    }
-                    if (!ok) continue;
-
-                    score += (ps.Length - args.Count) * 5;
-                    if (score < bestScore) { bestScore = score; best = m; }
                 }
                 else
                 {
-                    int fixedCount = ps.Length - 1;
-                    if (args.Count < fixedCount) continue;
+                    if (args.Count < minCount) continue;
+                }
 
-                    bool ok = true;
-                    int score = 0;
+                var built = new List<object?>();
+                int score = 0;
 
+                try
+                {
+                    int fixedCount = hasParams ? ps.Length - 1 : ps.Length;
+
+                    // fixed parameters
                     for (int i = 0; i < fixedCount; i++)
                     {
-                        int s = ScoreArg(args[i], ps[i].ParameterType);
-                        if (s == int.MaxValue) { ok = false; break; }
-                        score += s;
+                        if (i < args.Count)
+                        {
+                            var a = args[i];
+                            var conv = ConvertArg(a, ps[i].ParameterType);
+                            built.Add(conv);
+                            score += ScoreArg(a, conv, ps[i].ParameterType);
+                        }
+                        else
+                        {
+                            built.Add(ps[i].DefaultValue);
+                            score += 5; // penalty for default
+                        }
                     }
-                    if (!ok) continue;
 
-                    var elemType = ps[^1].ParameterType.GetElementType() ?? typeof(object);
-                    for (int j = fixedCount; j < args.Count; j++)
+                    // params array
+                    if (hasParams)
                     {
-                        int s = ScoreArg(args[j], elemType);
-                        if (s == int.MaxValue) { ok = false; break; }
-                        score += s + 1;
+                        Type elemType = ps[^1].ParameterType.GetElementType() ?? typeof(object);
+                        int extra = Math.Max(0, args.Count - fixedCount);
+                        Array arr = Array.CreateInstance(elemType, extra);
+                        for (int j = 0; j < extra; j++)
+                        {
+                            var a = args[fixedCount + j];
+                            var conv = ConvertArg(a, elemType);
+                            arr.SetValue(conv, j);
+                            score += ScoreArg(a, conv, elemType);
+                        }
+                        built.Add(arr);
                     }
-                    if (!ok) continue;
+                    else
+                    {
+                        // remaining optional (if any) already covered by exact count check
+                    }
 
-                    if (score < bestScore) { bestScore = score; best = m; }
+                    // prefer non-params / fewer defaults
+                    if (hasParams) score += 2;
+
+                    var cand = new Candidate(mb, score, built.ToArray());
+                    if (best == null || cand.Score < best.Score) best = cand;
+                }
+                catch
+                {
+                    continue;
                 }
             }
 
             if (best == null) throw new Exception("TypeError: no matching overload");
-            return best;
+
+            finalArgs = best.FinalArgs;
+            return best.M;
         }
 
-        private static ConstructorInfo SelectBestCtor(IEnumerable<ConstructorInfo> ctors, IList<object?> args)
+        private static int ScoreArg(object? original, object? converted, Type targetType)
         {
-            ConstructorInfo? best = null;
-            int bestScore = int.MaxValue;
-
-            foreach (var c in ctors)
-            {
-                var ps = c.GetParameters();
-                bool hasParams = HasParamArray(ps);
-
-                if (!hasParams)
-                {
-                    if (args.Count > ps.Length) continue;
-
-                    bool ok = true;
-                    for (int i = args.Count; i < ps.Length; i++)
-                        if (!ps[i].IsOptional) { ok = false; break; }
-                    if (!ok) continue;
-
-                    int score = 0;
-                    for (int i = 0; i < args.Count; i++)
-                    {
-                        int s = ScoreArg(args[i], ps[i].ParameterType);
-                        if (s == int.MaxValue) { ok = false; break; }
-                        score += s;
-                    }
-                    if (!ok) continue;
-
-                    score += (ps.Length - args.Count) * 5;
-                    if (score < bestScore) { bestScore = score; best = c; }
-                }
-                else
-                {
-                    int fixedCount = ps.Length - 1;
-                    if (args.Count < fixedCount) continue;
-
-                    bool ok = true;
-                    int score = 0;
-
-                    for (int i = 0; i < fixedCount; i++)
-                    {
-                        int s = ScoreArg(args[i], ps[i].ParameterType);
-                        if (s == int.MaxValue) { ok = false; break; }
-                        score += s;
-                    }
-                    if (!ok) continue;
-
-                    var elemType = ps[^1].ParameterType.GetElementType() ?? typeof(object);
-                    for (int j = fixedCount; j < args.Count; j++)
-                    {
-                        int s = ScoreArg(args[j], elemType);
-                        if (s == int.MaxValue) { ok = false; break; }
-                        score += s + 1;
-                    }
-                    if (!ok) continue;
-
-                    if (score < bestScore) { bestScore = score; best = c; }
-                }
-            }
-
-            if (best == null) throw new Exception("TypeError: no matching constructor");
-            return best;
+            if (original == null && converted == null) return 0;
+            if (original != null && converted != null && original.GetType() == converted.GetType()) return 0;
+            if (targetType == typeof(object)) return 3;
+            if (targetType == typeof(string)) return 3;
+            if (targetType.IsEnum) return 2;
+            return 1;
         }
 
-        private static int InheritanceDistance(Type start, Type? declaring)
+        private Delegate CreateDelegateFromFunction(Type delegateType, Function fn, object? thisValForCall)
         {
-            int d = 0;
-            var cur = start;
-            while (cur != null)
-            {
-                if (cur == declaring) return d;
-                cur = cur.BaseType!;
-                d++;
-            }
-            return 9999;
-        }
+            var invoke = delegateType.GetMethod("Invoke") ?? throw new Exception("TypeError: invalid delegate type");
+            var pars = invoke.GetParameters();
+            var paramExprs = pars.Select(p => Expression.Parameter(p.ParameterType, p.Name ?? "p")).ToArray();
 
-        private static PropertyInfo? FindBestProperty(Type t, string name, BindingFlags flags)
-        {
-            var props = t.GetProperties(flags)
-                .Where(p => p.Name == name && p.GetIndexParameters().Length == 0)
-                .ToArray();
-            if (props.Length == 0) return null;
-            return props.OrderBy(p => InheritanceDistance(t, p.DeclaringType)).First();
-        }
-
-        private static FieldInfo? FindBestField(Type t, string name, BindingFlags flags)
-        {
-            var fields = t.GetFields(flags).Where(f => f.Name == name).ToArray();
-            if (fields.Length == 0) return null;
-            return fields.OrderBy(f => InheritanceDistance(t, f.DeclaringType)).First();
-        }
-
-        private static EventInfo? FindBestEvent(Type t, string name, BindingFlags flags)
-        {
-            var evs = t.GetEvents(flags).Where(e => e.Name == name).ToArray();
-            if (evs.Length == 0) return null;
-            return evs.OrderBy(e => InheritanceDistance(t, e.DeclaringType)).First();
-        }
-
-        private static object? GetClrMember(object recvOrTypeOrNs, string name)
-        {
-            if (recvOrTypeOrNs is ClrNamespace ns)
-            {
-                string candidate = ns.Name + "." + name;
-                var t = ResolveClrType(candidate);
-                if (t != null) return t;
-                return new ClrNamespace(candidate);
-            }
-
-            if (recvOrTypeOrNs is Type st)
-            {
-                var flags = BindingFlags.Public | BindingFlags.Static;
-
-                var p = FindBestProperty(st, name, flags);
-                if (p != null) return p.GetValue(null);
-
-                var f = FindBestField(st, name, flags);
-                if (f != null) return f.GetValue(null);
-
-                var ms = st.GetMethods(flags).Where(m => m.Name == name).ToArray();
-                if (ms.Length > 0) return new ClrCallable(st, name);
-
-                return null;
-            }
-
-            var recv = recvOrTypeOrNs;
-            var rt = recv.GetType();
-            var iflags = BindingFlags.Public | BindingFlags.Instance;
-
-            var ip = FindBestProperty(rt, name, iflags);
-            if (ip != null) return ip.GetValue(recv);
-
-            var iff = FindBestField(rt, name, iflags);
-            if (iff != null) return iff.GetValue(recv);
-
-            var ims = rt.GetMethods(iflags).Where(m => m.Name == name).ToArray();
-            if (ims.Length > 0) return new ClrCallable(recv, name);
-
-            return null;
-        }
-
-        private object? InvokeScriptForEvent(Function fn, object?[] args)
-        {
-            var list = new List<object?>(args.Length);
-            for (int i = 0; i < args.Length; i++) list.Add(args[i]);
-            object? thisVal = args.Length > 0 ? args[0] : null;
-            return CallFunction(fn, list, thisVal);
-        }
-
-        private static object? CoerceReturn(object? v, Type retType)
-        {
-            if (retType == typeof(void)) return null;
-
-            if (v == null)
-                return retType.IsValueType ? Activator.CreateInstance(retType) : null;
-
-            if (retType.IsInstanceOfType(v)) return v;
-            return ConvertArg(v, retType);
-        }
-
-        private Delegate MakeClrEventDelegate(Type delegateType, Function fn)
-        {
-            var invoke = delegateType.GetMethod("Invoke") ?? throw new Exception("TypeError: invalid event handler type");
-            var ps = invoke.GetParameters();
-
-            var paramExprs = ps.Select(p => Expression.Parameter(p.ParameterType, p.Name ?? "p")).ToArray();
-
-            var argsArray = Expression.NewArrayInit(
+            // build: (p1,p2,...) => { call script fn with args (boxed), return default(T) }
+            var argsArrExpr = Expression.NewArrayInit(
                 typeof(object),
-                paramExprs.Select(p => Expression.Convert(p, typeof(object)))
+                paramExprs.Select(pe => Expression.Convert(pe, typeof(object)))
             );
 
-            var callMi = typeof(Interpreter).GetMethod(nameof(InvokeScriptForEvent), BindingFlags.Instance | BindingFlags.NonPublic)!;
-            var call = Expression.Call(Expression.Constant(this), callMi, Expression.Constant(fn), argsArray);
+            var callHelper = typeof(Interpreter).GetMethod(nameof(InvokeScriptFromDelegate), BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+            var callExpr = Expression.Call(
+                Expression.Constant(this),
+                callHelper,
+                Expression.Constant(fn, typeof(Function)),
+                Expression.Constant(thisValForCall, typeof(object)),
+                argsArrExpr
+            );
 
             Expression body;
             if (invoke.ReturnType == typeof(void))
             {
-                body = Expression.Block(call, Expression.Empty());
+                body = callExpr;
             }
             else
             {
-                var coerceMi = typeof(Interpreter).GetMethod(nameof(CoerceReturn), BindingFlags.Static | BindingFlags.NonPublic)!;
-                var coerced = Expression.Call(coerceMi, call, Expression.Constant(invoke.ReturnType, typeof(Type)));
-                body = Expression.Convert(coerced, invoke.ReturnType);
+                // convert result to return type (best-effort)
+                var convertHelper = typeof(Interpreter).GetMethod(nameof(ConvertReturnForDelegate), BindingFlags.Instance | BindingFlags.NonPublic)!;
+                var converted = Expression.Call(
+                    Expression.Constant(this),
+                    convertHelper,
+                    callExpr,
+                    Expression.Constant(invoke.ReturnType, typeof(Type))
+                );
+                body = Expression.Convert(converted, invoke.ReturnType);
             }
 
-            return Expression.Lambda(delegateType, body, paramExprs).Compile();
+            var lambda = Expression.Lambda(delegateType, body, paramExprs);
+            return lambda.Compile();
         }
 
-        private void SetClrEventHandler(object? instanceTarget, Type? staticTypeKey, EventInfo ev, object? value)
+        private object? ConvertReturnForDelegate(object? v, Type returnType)
         {
-            object keyTarget = staticTypeKey != null ? (object)staticTypeKey : (instanceTarget ?? throw new Exception("TypeError: event on null"));
-            var key = new EventKey(keyTarget, ev.Name);
-
-            if (_eventSubs.TryGetValue(key, out var oldList))
-            {
-                foreach (var d in oldList)
-                    ev.RemoveEventHandler(instanceTarget, d);
-                _eventSubs.Remove(key);
-            }
-
-            if (value == null) return;
-
-            if (value is Function fn)
-            {
-                var delType = ev.EventHandlerType ?? throw new Exception("TypeError: event has no handler type");
-                var del = MakeClrEventDelegate(delType, fn);
-
-                ev.AddEventHandler(instanceTarget, del);
-                _eventSubs[key] = new List<Delegate> { del };
-                return;
-            }
-
-            throw new Exception($"TypeError: event '{ev.Name}' expects a function");
+            if (returnType == typeof(object)) return v;
+            if (returnType == typeof(void)) return null;
+            return ConvertArg(v, returnType);
         }
 
-        private void SetClrMember(object recvOrType, string name, object? value)
+        private object? InvokeScriptFromDelegate(Function fn, object? thisVal, object[] args)
         {
-            if (recvOrType is Type st)
-            {
-                var flags = BindingFlags.Public | BindingFlags.Static;
+            var list = new List<object?>();
+            foreach (var a in args) list.Add(a);
 
-                var evS = FindBestEvent(st, name, flags);
-                if (evS != null) { SetClrEventHandler(null, st, evS, value); return; }
+            // JS-ish: if fn has fewer params, pass only that many
+            if (fn.Params.Count >= 0 && list.Count > fn.Params.Count)
+                list = list.Take(fn.Params.Count).ToList();
 
-                var p = FindBestProperty(st, name, flags);
-                if (p != null) { p.SetValue(null, ConvertArg(value, p.PropertyType)); return; }
-
-                var f = FindBestField(st, name, flags);
-                if (f != null) { f.SetValue(null, ConvertArg(value, f.FieldType)); return; }
-
-                throw new Exception($"TypeError: static member '{name}' not found or not settable");
-            }
-
-            var recv = recvOrType;
-            var rt = recv.GetType();
-            var flagsI = BindingFlags.Public | BindingFlags.Instance;
-
-            var evI = FindBestEvent(rt, name, flagsI);
-            if (evI != null) { SetClrEventHandler(recv, null, evI, value); return; }
-
-            var ip = FindBestProperty(rt, name, flagsI);
-            if (ip != null)
-            {
-                if (!ip.CanWrite) throw new Exception($"TypeError: property '{name}' is read-only");
-                ip.SetValue(recv, ConvertArg(value, ip.PropertyType));
-                return;
-            }
-
-            var iff = FindBestField(rt, name, flagsI);
-            if (iff != null) { iff.SetValue(recv, ConvertArg(value, iff.FieldType)); return; }
-
-            throw new Exception($"TypeError: member '{name}' not found or not settable");
+            return CallFunction(fn, list, thisVal);
         }
 
-        private static object? GetClrIndex(object recv, object? idx)
+        // ---------------- Event bridging (generic) ----------------
+
+        private void SetEventHandler(object target, EventInfo ev, object? newVal)
         {
-            if (recv is Array arr)
-            {
-                int i = (int)Rt.ToNumber(idx);
-                return arr.GetValue(i);
-            }
+            var key = new EventKey(target, ev.Name);
 
-            if (recv is IList list)
+            // remove old
+            lock (_eventSubsGuard)
             {
-                int i = (int)Rt.ToNumber(idx);
-                return list[i];
-            }
-
-            if (recv is IDictionary dict)
-            {
-                var key = idx;
-                if (key is double d) key = (int)d;
-                if (key is null) key = "";
-                return dict[key];
-            }
-
-            var t = recv.GetType();
-            var props = t.GetDefaultMembers().OfType<PropertyInfo>().ToArray();
-            foreach (var p in props)
-            {
-                var ps = p.GetIndexParameters();
-                if (ps.Length == 1)
+                if (_eventSubs.TryGetValue(key, out var oldList))
                 {
-                    var key = ConvertArg(idx, ps[0].ParameterType);
-                    return p.GetValue(recv, new[] { key });
+                    foreach (var d in oldList)
+                        ev.RemoveEventHandler(target, d);
+                    _eventSubs.Remove(key);
                 }
             }
 
-            throw new Exception("TypeError: index access on non-indexable CLR object");
-        }
+            if (newVal == null) return;
 
-        private static void SetClrIndex(object recv, object? idx, object? val)
-        {
-            if (recv is Array arr)
-            {
-                int i = (int)Rt.ToNumber(idx);
-                var et = arr.GetType().GetElementType() ?? typeof(object);
-                arr.SetValue(ConvertArg(val, et), i);
-                return;
-            }
+            if (newVal is not Function fn)
+                throw new Exception($"TypeError: event '{ev.Name}' expects function or null");
 
-            if (recv is IList list)
-            {
-                int i = (int)Rt.ToNumber(idx);
-                list[i] = val;
-                return;
-            }
+            var del = CreateDelegateFromFunction(ev.EventHandlerType!, fn, thisValForCall: target);
 
-            if (recv is IDictionary dict)
-            {
-                var key = idx;
-                if (key is double d) key = (int)d;
-                if (key is null) key = "";
-                dict[key] = val;
-                return;
-            }
+            ev.AddEventHandler(target, del);
 
-            var t = recv.GetType();
-            var props = t.GetDefaultMembers().OfType<PropertyInfo>().ToArray();
-            foreach (var p in props)
+            lock (_eventSubsGuard)
             {
-                var ps = p.GetIndexParameters();
-                if (ps.Length == 1 && p.CanWrite)
+                if (!_eventSubs.TryGetValue(key, out var list))
                 {
-                    var key = ConvertArg(idx, ps[0].ParameterType);
-                    var vv = ConvertArg(val, p.PropertyType);
-                    p.SetValue(recv, vv, new[] { key });
-                    return;
+                    list = new List<Delegate>();
+                    _eventSubs[key] = list;
                 }
-            }
-
-            throw new Exception("TypeError: index assign on non-indexable CLR object");
-        }
-
-        private static object? InvokeClrCallable(ClrCallable c, List<object?> args)
-        {
-            if (c.Target is Type st)
-            {
-                var flags = BindingFlags.Public | BindingFlags.Static;
-                var ms = st.GetMethods(flags).Where(m => m.Name == c.Name);
-                var best = SelectBestMethod(ms, args);
-                var conv = PrepareInvokeArgs(best.GetParameters(), args);
-                return best.Invoke(null, conv);
-            }
-            else
-            {
-                var recv = c.Target ?? throw new Exception("TypeError: null target");
-                var t = recv.GetType();
-                var flags = BindingFlags.Public | BindingFlags.Instance;
-                var ms = t.GetMethods(flags).Where(m => m.Name == c.Name);
-                var best = SelectBestMethod(ms, args);
-                var conv = PrepareInvokeArgs(best.GetParameters(), args);
-                return best.Invoke(recv, conv);
+                list.Add(del);
             }
         }
 
-        private static object CreateClrInstance(Type t, List<object?> args)
-        {
-            // static class => give back the Type (so you can use it as "System.IO.File.ReadAllText(...)")
-            if (t.IsAbstract && t.IsSealed)
-            {
-                if (args.Count != 0)
-                    throw new Exception($"TypeError: cannot construct static class '{t.FullName}' with arguments");
-                return t;
-            }
+        // ---------------- LValue get/set for ++, assignments ----------------
 
-            if (t.IsAbstract || t.IsInterface)
-                throw new Exception($"TypeError: cannot instantiate abstract/interface type '{t.FullName}'");
-
-            var ctors = t.GetConstructors(BindingFlags.Public | BindingFlags.Instance);
-            if (ctors.Length == 0)
-            {
-                if (args.Count == 0) return Activator.CreateInstance(t)!;
-                throw new Exception("TypeError: type has no public constructors");
-            }
-
-            var best = SelectBestCtor(ctors, args);
-            var conv = PrepareInvokeArgs(best.GetParameters(), args);
-            return best.Invoke(conv);
-        }
-
-        // ---------------- Concurrency helpers ----------------
-
-        private object GetLockObject(object? v)
-        {
-            if (v is null) throw new Exception("TypeError: lock(expr) with null");
-
-            if (v is string s)
-            {
-                lock (_namedLocksGuard)
-                {
-                    if (!_namedLocks.TryGetValue(s, out var o))
-                    {
-                        o = new object();
-                        _namedLocks[s] = o;
-                    }
-                    return o;
-                }
-            }
-
-            if (v is double or float or int or long or bool)
-                throw new Exception("TypeError: lock(expr) expects object or string name (not primitive)");
-
-            return v;
-        }
-
-        private JsTask StartTask(Node expr, Env env)
-        {
-            var task = _taskMgr.Enqueue(() => Eval(expr, env));
-            return new JsTask(task);
-        }
-
-        private static object? AwaitAny(object? v)
-        {
-            if (v is null) return null;
-
-            if (v is JsTask jt)
-                return jt.Task.GetAwaiter().GetResult();
-
-            if (v is Task t)
-            {
-                var tt = t.GetType();
-                if (tt.IsGenericType && tt.GetGenericTypeDefinition() == typeof(Task<>))
-                {
-                    t.GetAwaiter().GetResult();
-                    var resProp = tt.GetProperty("Result", BindingFlags.Public | BindingFlags.Instance);
-                    return resProp?.GetValue(t);
-                }
-
-                t.GetAwaiter().GetResult();
-                return null;
-            }
-
-            if (v is Delegate d)
-            {
-                var rv = d.DynamicInvoke();
-                return AwaitAny(rv);
-            }
-
-            throw new Exception("TypeError: await/join expects a task");
-        }
-
-        private static void YieldOnce() => Thread.Sleep(1);
-
-        // ---------------- LValue Get/Set ----------------
-
+        // kind: 0=var, 1=member, 2=index
         private object? EvalLValueGet(Node target, Env env, ref object? outRecv, ref string outProp, ref object? outIdx, ref int outKind)
         {
             if (target.Type == NodeType.Var)
@@ -2242,14 +2001,63 @@ namespace MiniJs
                     lock (jo)
                     {
                         if (jo.Props.TryGetValue(outProp, out var v)) return v;
-                        if (jo.Klass != null && jo.Klass.Methods.TryGetValue(outProp, out var mfn))
-                            return mfn;
+                        if (jo.Klass != null && jo.Klass.Methods.TryGetValue(outProp, out var mfn)) return mfn;
                     }
                     return null;
                 }
 
-                if (outRecv is null) throw new Exception("TypeError: member access on null");
-                return GetClrMember(outRecv, outProp);
+                if (outRecv is Type tStatic)
+                {
+                    // static access
+                    if (tStatic.IsEnum)
+                    {
+                        try { return Enum.Parse(tStatic, outProp, ignoreCase: true); } catch { return null; }
+                    }
+
+                    var p = GetMostDerivedProperty(tStatic, outProp, isStatic: true);
+                    if (p != null && p.GetMethod != null) return p.GetValue(null);
+
+                    var f = GetMostDerivedField(tStatic, outProp, isStatic: true);
+                    if (f != null) return f.GetValue(null);
+
+                    var ev = GetMostDerivedEvent(tStatic, outProp, isStatic: true);
+                    if (ev != null) return null;
+
+                    var ms = GetAllMethods(tStatic, outProp, isStatic: true);
+                    if (ms.Length > 0) return new ClrCallable(tStatic, outProp);
+
+                    return null;
+                }
+
+                if (outRecv is ClrNamespace ns)
+                {
+                    // namespace resolution: return nested namespace or type
+                    string full = ns.Name + "." + outProp;
+                    var ty = ResolveClrType(full);
+                    if (ty != null) return ty;
+                    return new ClrNamespace(full);
+                }
+
+                if (outRecv != null)
+                {
+                    var t = outRecv.GetType();
+
+                    var p = GetMostDerivedProperty(t, outProp, isStatic: false);
+                    if (p != null && p.GetMethod != null) return p.GetValue(outRecv);
+
+                    var f = GetMostDerivedField(t, outProp, isStatic: false);
+                    if (f != null) return f.GetValue(outRecv);
+
+                    var ev = GetMostDerivedEvent(t, outProp, isStatic: false);
+                    if (ev != null) return null;
+
+                    var ms = GetAllMethods(t, outProp, isStatic: false);
+                    if (ms.Length > 0) return new ClrCallable(outRecv, outProp);
+
+                    return null;
+                }
+
+                return null;
             }
 
             if (target.Type == NodeType.Index)
@@ -2258,28 +2066,47 @@ namespace MiniJs
                 outRecv = Eval(target.Kids[0]!, env);
                 outIdx = Eval(target.Kids[1]!, env);
 
-                if (outRecv is JsArray a)
+                if (outRecv is JsArray ja)
                 {
-                    lock (a)
+                    long i = (long)Rt.ToNumber(outIdx);
+                    lock (ja)
                     {
-                        long i = (long)Rt.ToNumber(outIdx);
-                        if (i < 0 || i >= a.Items.Count) return null;
-                        return a.Items[(int)i];
+                        if (i < 0 || i >= ja.Items.Count) return null;
+                        return ja.Items[(int)i];
                     }
                 }
 
-                if (outRecv is JsObject o)
+                if (outRecv is JsObject jo)
                 {
                     string key = Rt.ToJsString(outIdx);
-                    lock (o)
+                    lock (jo)
                     {
-                        if (o.Props.TryGetValue(key, out var v)) return v;
+                        if (jo.Props.TryGetValue(key, out var v)) return v;
+                        return null;
                     }
-                    return null;
                 }
 
-                if (outRecv is null) throw new Exception("TypeError: index access on null");
-                return GetClrIndex(outRecv, outIdx);
+                if (outRecv is Array arr)
+                {
+                    int i = (int)Rt.ToNumber(outIdx);
+                    if (i < 0 || i >= arr.Length) return null;
+                    return arr.GetValue(i);
+                }
+
+                if (outRecv is IList list)
+                {
+                    int i = (int)Rt.ToNumber(outIdx);
+                    if (i < 0 || i >= list.Count) return null;
+                    return list[i];
+                }
+
+                if (outRecv is IDictionary dict)
+                {
+                    var key = outIdx;
+                    return dict.Contains(key) ? dict[key] : null;
+                }
+
+                throw new Exception("TypeError: index access on non-array/object");
             }
 
             throw new Exception("Invalid assignment target");
@@ -2287,55 +2114,201 @@ namespace MiniJs
 
         private void EvalLValueSet(Node target, Env env, object? recv, string prop, object? idx, int kind, object? newVal)
         {
-            if (kind == 0) { env.Set(prop, newVal); return; }
+            if (kind == 0)
+            {
+                env.Set(prop, newVal);
+                return;
+            }
 
             if (kind == 1)
             {
-                if (recv is JsObject o)
+                if (recv is JsObject jo)
                 {
-                    lock (o)
+                    lock (jo)
                     {
-                        if (!o.Props.ContainsKey(prop)) o.Order.Add(prop);
-                        o.Props[prop] = newVal;
+                        if (!jo.Props.ContainsKey(prop)) jo.Order.Add(prop);
+                        jo.Props[prop] = newVal;
                     }
                     return;
                 }
 
-                if (recv is null) throw new Exception("TypeError: member assign on null");
-                SetClrMember(recv, prop, newVal);
-                return;
+                if (recv is Type tStatic)
+                {
+                    var p = GetMostDerivedProperty(tStatic, prop, isStatic: true);
+                    if (p != null && p.SetMethod != null)
+                    {
+                        var cv = ConvertArg(newVal, p.PropertyType);
+                        p.SetValue(null, cv);
+                        return;
+                    }
+
+                    var f = GetMostDerivedField(tStatic, prop, isStatic: true);
+                    if (f != null && !f.IsInitOnly)
+                    {
+                        var cv = ConvertArg(newVal, f.FieldType);
+                        f.SetValue(null, cv);
+                        return;
+                    }
+
+                    var ev = GetMostDerivedEvent(tStatic, prop, isStatic: true);
+                    if (ev != null) throw new Exception("TypeError: cannot assign static event this way");
+
+                    throw new Exception($"TypeError: cannot set member '{prop}' on type '{tStatic.FullName}'");
+                }
+
+                if (recv == null) throw new Exception("TypeError: member set on null");
+
+                var t = recv.GetType();
+
+                // event assign bridge
+                var ev2 = GetMostDerivedEvent(t, prop, isStatic: false);
+                if (ev2 != null)
+                {
+                    SetEventHandler(recv, ev2, newVal);
+                    return;
+                }
+
+                var p2 = GetMostDerivedProperty(t, prop, isStatic: false);
+                if (p2 != null && p2.SetMethod != null)
+                {
+                    var cv = ConvertArg(newVal, p2.PropertyType);
+                    p2.SetValue(recv, cv);
+                    return;
+                }
+
+                var f2 = GetMostDerivedField(t, prop, isStatic: false);
+                if (f2 != null && !f2.IsInitOnly)
+                {
+                    var cv = ConvertArg(newVal, f2.FieldType);
+                    f2.SetValue(recv, cv);
+                    return;
+                }
+
+                throw new Exception($"TypeError: cannot set member '{prop}' on '{t.Name}'");
             }
 
             if (kind == 2)
             {
-                if (recv is JsArray a)
+                if (recv is JsArray ja)
                 {
-                    lock (a)
+                    long i = (long)Rt.ToNumber(idx);
+                    if (i < 0) throw new Exception("RangeError: negative index");
+                    int ui = (int)i;
+                    lock (ja)
                     {
-                        long i = (long)Rt.ToNumber(idx);
-                        if (i < 0) throw new Exception("RangeError: negative index");
-                        int ui = (int)i;
-                        while (a.Items.Count <= ui) a.Items.Add(null);
-                        a.Items[ui] = newVal;
+                        while (ja.Items.Count <= ui) ja.Items.Add(null);
+                        ja.Items[ui] = newVal;
                     }
                     return;
                 }
 
-                if (recv is JsObject o)
+                if (recv is JsObject jo)
                 {
                     string k = Rt.ToJsString(idx);
-                    lock (o)
+                    lock (jo)
                     {
-                        if (!o.Props.ContainsKey(k)) o.Order.Add(k);
-                        o.Props[k] = newVal;
+                        if (!jo.Props.ContainsKey(k)) jo.Order.Add(k);
+                        jo.Props[k] = newVal;
                     }
                     return;
                 }
 
-                if (recv is null) throw new Exception("TypeError: index assign on null");
-                SetClrIndex(recv, idx, newVal);
-                return;
+                if (recv is Array arr)
+                {
+                    int i = (int)Rt.ToNumber(idx);
+                    if (i < 0 || i >= arr.Length) throw new Exception("RangeError: index out of range");
+                    var cv = ConvertArg(newVal, arr.GetType().GetElementType() ?? typeof(object));
+                    arr.SetValue(cv, i);
+                    return;
+                }
+
+                if (recv is IList list)
+                {
+                    int i = (int)Rt.ToNumber(idx);
+                    if (i < 0) throw new Exception("RangeError: negative index");
+                    while (list.Count <= i) list.Add(null);
+                    list[i] = newVal;
+                    return;
+                }
+
+                if (recv is IDictionary dict)
+                {
+                    dict[idx!] = newVal;
+                    return;
+                }
+
+                throw new Exception("TypeError: index assign on non-array/object");
             }
+        }
+
+        // ---------------- CLR invoke ----------------
+
+        private object? InvokeClrMethod(object? targetOrType, string name, List<object?> args)
+        {
+            if (targetOrType is Type t)
+            {
+                var methods = GetAllMethods(t, name, isStatic: true).Cast<MethodBase>().ToArray();
+                if (methods.Length == 0) throw new Exception($"TypeError: method not found: {t.FullName}.{name}");
+
+                var mb = SelectBestOverload(methods, args, out var finalArgs);
+                return mb.Invoke(null, finalArgs);
+            }
+            else
+            {
+                if (targetOrType == null) throw new Exception("TypeError: call on null");
+                var t2 = targetOrType.GetType();
+
+                var methods = GetAllMethods(t2, name, isStatic: false).Cast<MethodBase>().ToArray();
+                if (methods.Length == 0) throw new Exception($"TypeError: method not found: {t2.Name}.{name}");
+
+                var mb = SelectBestOverload(methods, args, out var finalArgs);
+                return mb.Invoke(targetOrType, finalArgs);
+            }
+        }
+
+        private object? CreateClrInstance(Type t, List<object?> args)
+        {
+            if (t.IsAbstract && t.IsSealed)
+                throw new Exception($"Cannot dynamically create an instance of type '{t.FullName}'. Reason: Cannot create a static class.");
+
+            if (t.IsAbstract)
+                throw new Exception($"Cannot dynamically create an instance of type '{t.FullName}'. Reason: Cannot create an abstract class.");
+
+            var ctors = t.GetConstructors(BindingFlags.Public | BindingFlags.Instance).Cast<MethodBase>().ToArray();
+            if (ctors.Length == 0)
+            {
+                if (args.Count == 0) return Activator.CreateInstance(t);
+                throw new Exception($"TypeError: no public constructors for {t.FullName}");
+            }
+
+            var mb = SelectBestOverload(ctors, args, out var finalArgs);
+            return ((ConstructorInfo)mb).Invoke(finalArgs);
+        }
+
+        // ---------------- Binary ops ----------------
+
+        private object? BinaryPlus(object? l, object? r)
+        {
+            if (l is string || r is string)
+                return Rt.ToJsString(l) + Rt.ToJsString(r);
+            return Rt.ToNumber(l) + Rt.ToNumber(r);
+        }
+
+        private static bool StrictEq(object? a, object? b)
+        {
+            if (a == null && b == null) return true;
+            if (a == null || b == null) return false;
+
+            if (Rt.IsNumeric(a) && Rt.IsNumeric(b))
+                return Rt.ToNumber(a) == Rt.ToNumber(b);
+
+            if (a.GetType() != b.GetType()) return false;
+
+            // for reference types, keep JS-ish strictness by reference equality
+            if (!a.GetType().IsValueType)
+                return ReferenceEquals(a, b);
+
+            return a.Equals(b);
         }
 
         // ---------------- Eval / Exec ----------------
@@ -2361,21 +2334,6 @@ namespace MiniJs
                         return last;
                     }
 
-                case NodeType.TaskBlock:
-                    {
-                        var benv = new Env(env);
-                        object? last = null;
-                        try
-                        {
-                            foreach (var s in n.Kids) last = Exec(s!, benv);
-                            return last;
-                        }
-                        catch (ReturnSignal rs)
-                        {
-                            return rs.Value;
-                        }
-                    }
-
                 case NodeType.Literal:
                     {
                         if (n.Tok.Type == TokType.NUMBER) return double.Parse(n.Tok.Lexeme, CultureInfo.InvariantCulture);
@@ -2391,20 +2349,23 @@ namespace MiniJs
                 case NodeType.ArrayLit:
                     {
                         var a = new JsArray();
-                        foreach (var k in n.Kids) a.Items.Add(Eval(k!, env));
+                        lock (a)
+                        {
+                            foreach (var k in n.Kids) a.Items.Add(Eval(k!, env));
+                        }
                         return a;
                     }
 
                 case NodeType.ObjectLit:
                     {
                         var o = new JsObject();
-                        for (int i = 0; i + 1 < n.Kids.Count; i += 2)
+                        lock (o)
                         {
-                            var keyNode = n.Kids[i]!;
-                            var valNode = n.Kids[i + 1]!;
-                            string k = keyNode.Tok.Lexeme;
-                            lock (o)
+                            for (int i = 0; i + 1 < n.Kids.Count; i += 2)
                             {
+                                var keyNode = n.Kids[i]!;
+                                var valNode = n.Kids[i + 1]!;
+                                string k = keyNode.Tok.Lexeme;
                                 if (!o.Props.ContainsKey(k)) o.Order.Add(k);
                                 o.Props[k] = Eval(valNode, env);
                             }
@@ -2419,13 +2380,11 @@ namespace MiniJs
                         return fn;
                     }
 
-                case NodeType.TaskExpr:
-                    return StartTask(n.Kids[0]!, env);
-
-                case NodeType.AwaitExpr:
+                case NodeType.TaskBlock:
                     {
-                        var v = Eval(n.Kids[0]!, env);
-                        return AwaitAny(v);
+                        // internal: used by task expression
+                        var fn = new Function { Closure = env, Body = n };
+                        return fn;
                     }
 
                 case NodeType.Unary:
@@ -2437,7 +2396,7 @@ namespace MiniJs
                             case TokType.BANG: return !Rt.IsTruthy(r);
                             case TokType.PLUS: return Rt.ToNumber(r);
                             case TokType.MINUS: return -Rt.ToNumber(r);
-                            case TokType.BITNOT: return (double)(~Rt.ToInt32(r));
+                            case TokType.BITNOT: return ~Rt.ToInt32(r);
 
                             case TokType.INC:
                             case TokType.DEC:
@@ -2447,7 +2406,7 @@ namespace MiniJs
                                     object? oldVal = EvalLValueGet(target, env, ref recv, ref prop, ref idx, ref kind);
                                     double x = Rt.ToNumber(oldVal);
                                     double nx = (n.Tok.Type == TokType.INC) ? (x + 1.0) : (x - 1.0);
-                                    object? newVal = nx;
+                                    var newVal = (object?)nx;
                                     EvalLValueSet(target, env, recv, prop, idx, kind, newVal);
                                     return newVal;
                                 }
@@ -2464,7 +2423,7 @@ namespace MiniJs
                         object? oldVal = EvalLValueGet(target, env, ref recv, ref prop, ref idx, ref kind);
                         double x = Rt.ToNumber(oldVal);
                         double nx = (n.Tok.Type == TokType.INC) ? (x + 1.0) : (x - 1.0);
-                        object? newVal = nx;
+                        var newVal = (object?)nx;
                         EvalLValueSet(target, env, recv, prop, idx, kind, newVal);
                         return oldVal;
                     }
@@ -2473,43 +2432,44 @@ namespace MiniJs
                     {
                         if (n.Tok.Type == TokType.AND)
                         {
-                            object? l = Eval(n.Kids[0]!, env);
+                            var l = Eval(n.Kids[0]!, env);
                             if (!Rt.IsTruthy(l)) return l;
                             return Eval(n.Kids[1]!, env);
                         }
                         if (n.Tok.Type == TokType.OR)
                         {
-                            object? l = Eval(n.Kids[0]!, env);
+                            var l = Eval(n.Kids[0]!, env);
                             if (Rt.IsTruthy(l)) return l;
                             return Eval(n.Kids[1]!, env);
                         }
 
-                        object? l2 = Eval(n.Kids[0]!, env);
-                        object? r2 = Eval(n.Kids[1]!, env);
+                        var l2 = Eval(n.Kids[0]!, env);
+                        var r2 = Eval(n.Kids[1]!, env);
 
-                        return n.Tok.Type switch
+                        switch (n.Tok.Type)
                         {
-                            TokType.PLUS => BinaryPlus(l2, r2),
-                            TokType.MINUS => Rt.ToNumber(l2) - Rt.ToNumber(r2),
-                            TokType.MUL => Rt.ToNumber(l2) * Rt.ToNumber(r2),
-                            TokType.DIV => Rt.ToNumber(l2) / Rt.ToNumber(r2),
-                            TokType.MOD => Rt.ToNumber(l2) % Rt.ToNumber(r2),
-                            TokType.POW => Math.Pow(Rt.ToNumber(l2), Rt.ToNumber(r2)),
+                            case TokType.PLUS: return BinaryPlus(l2, r2);
+                            case TokType.MINUS: return Rt.ToNumber(l2) - Rt.ToNumber(r2);
+                            case TokType.MUL: return Rt.ToNumber(l2) * Rt.ToNumber(r2);
+                            case TokType.DIV: return Rt.ToNumber(l2) / Rt.ToNumber(r2);
+                            case TokType.MOD: return Rt.ToNumber(l2) % Rt.ToNumber(r2);
+                            case TokType.POW: return Math.Pow(Rt.ToNumber(l2), Rt.ToNumber(r2));
 
-                            TokType.LT => Rt.ToNumber(l2) < Rt.ToNumber(r2),
-                            TokType.LEQ => Rt.ToNumber(l2) <= Rt.ToNumber(r2),
-                            TokType.GT => Rt.ToNumber(l2) > Rt.ToNumber(r2),
-                            TokType.GEQ => Rt.ToNumber(l2) >= Rt.ToNumber(r2),
+                            case TokType.LT: return Rt.ToNumber(l2) < Rt.ToNumber(r2);
+                            case TokType.LEQ: return Rt.ToNumber(l2) <= Rt.ToNumber(r2);
+                            case TokType.GT: return Rt.ToNumber(l2) > Rt.ToNumber(r2);
+                            case TokType.GEQ: return Rt.ToNumber(l2) >= Rt.ToNumber(r2);
 
-                            TokType.BITAND => (double)(Rt.ToInt32(l2) & Rt.ToInt32(r2)),
-                            TokType.BITOR => (double)(Rt.ToInt32(l2) | Rt.ToInt32(r2)),
-                            TokType.BITXOR => (double)(Rt.ToInt32(l2) ^ Rt.ToInt32(r2)),
+                            case TokType.BITAND: return Rt.ToInt32(l2) & Rt.ToInt32(r2);
+                            case TokType.BITOR: return Rt.ToInt32(l2) | Rt.ToInt32(r2);
+                            case TokType.BITXOR: return Rt.ToInt32(l2) ^ Rt.ToInt32(r2);
 
-                            TokType.EQ => EqualsForRuntime(l2, r2),
-                            TokType.NEQ => !EqualsForRuntime(l2, r2),
+                            case TokType.EQ: return StrictEq(l2, r2);
+                            case TokType.NEQ: return !StrictEq(l2, r2);
 
-                            _ => throw new Exception("Unknown binary op")
-                        };
+                            default:
+                                throw new Exception("Unknown binary op");
+                        }
                     }
 
                 case NodeType.Member:
@@ -2517,28 +2477,75 @@ namespace MiniJs
                         object? recv = Eval(n.Kids[0]!, env);
                         string prop = n.Kids[1]!.Tok.Lexeme;
 
-                        if (recv is JsArray a)
+                        // namespace: System.X
+                        if (recv is ClrNamespace ns)
                         {
-                            lock (a)
+                            string full = ns.Name + "." + prop;
+                            var ty = ResolveClrType(full);
+                            if (ty != null) return ty;
+                            return new ClrNamespace(full);
+                        }
+
+                        // Type: static access / enum access
+                        if (recv is Type tStatic)
+                        {
+                            if (tStatic.IsEnum)
                             {
-                                if (prop == "length") return (double)a.Items.Count;
+                                try { return Enum.Parse(tStatic, prop, ignoreCase: true); } catch { return null; }
                             }
+
+                            var p = GetMostDerivedProperty(tStatic, prop, isStatic: true);
+                            if (p != null && p.GetMethod != null) return p.GetValue(null);
+
+                            var f = GetMostDerivedField(tStatic, prop, isStatic: true);
+                            if (f != null) return f.GetValue(null);
+
+                            var ev = GetMostDerivedEvent(tStatic, prop, isStatic: true);
+                            if (ev != null) return null;
+
+                            var ms = GetAllMethods(tStatic, prop, isStatic: true);
+                            if (ms.Length > 0) return new ClrCallable(tStatic, prop);
+
                             return null;
                         }
 
-                        if (recv is JsObject o)
+                        // script object
+                        if (recv is JsObject jo)
                         {
-                            lock (o)
+                            lock (jo)
                             {
-                                if (o.Props.TryGetValue(prop, out var v)) return v;
-                                if (o.Klass != null && o.Klass.Methods.TryGetValue(prop, out var mfn))
+                                if (jo.Props.TryGetValue(prop, out var v)) return v;
+                                if (jo.Klass != null && jo.Klass.Methods.TryGetValue(prop, out var mfn))
                                     return mfn;
                             }
                             return null;
                         }
 
-                        if (recv is null) throw new Exception("TypeError: member access on null");
-                        return GetClrMember(recv, prop);
+                        // CLR object
+                        if (recv != null)
+                        {
+                            var t = recv.GetType();
+
+                            // arrays: expose Length
+                            if (recv is Array arr && prop == "Length") return (double)arr.Length;
+                            if (recv is IList list && prop == "Count") return (double)list.Count;
+
+                            var p = GetMostDerivedProperty(t, prop, isStatic: false);
+                            if (p != null && p.GetMethod != null) return p.GetValue(recv);
+
+                            var f = GetMostDerivedField(t, prop, isStatic: false);
+                            if (f != null) return f.GetValue(recv);
+
+                            var ev = GetMostDerivedEvent(t, prop, isStatic: false);
+                            if (ev != null) return null;
+
+                            var ms = GetAllMethods(t, prop, isStatic: false);
+                            if (ms.Length > 0) return new ClrCallable(recv, prop);
+
+                            return null;
+                        }
+
+                        throw new Exception("TypeError: member access on null");
                     }
 
                 case NodeType.Index:
@@ -2546,28 +2553,46 @@ namespace MiniJs
                         object? recv = Eval(n.Kids[0]!, env);
                         object? idx = Eval(n.Kids[1]!, env);
 
-                        if (recv is JsArray a)
+                        if (recv is JsArray ja)
                         {
-                            lock (a)
+                            long i = (long)Rt.ToNumber(idx);
+                            lock (ja)
                             {
-                                long i = (long)Rt.ToNumber(idx);
-                                if (i < 0 || i >= a.Items.Count) return null;
-                                return a.Items[(int)i];
+                                if (i < 0 || i >= ja.Items.Count) return null;
+                                return ja.Items[(int)i];
                             }
                         }
 
-                        if (recv is JsObject o)
+                        if (recv is JsObject jo)
                         {
                             string key = Rt.ToJsString(idx);
-                            lock (o)
+                            lock (jo)
                             {
-                                if (o.Props.TryGetValue(key, out var v)) return v;
+                                if (jo.Props.TryGetValue(key, out var v)) return v;
+                                return null;
                             }
-                            return null;
                         }
 
-                        if (recv is null) throw new Exception("TypeError: index access on null");
-                        return GetClrIndex(recv, idx);
+                        if (recv is Array arr)
+                        {
+                            int i = (int)Rt.ToNumber(idx);
+                            if (i < 0 || i >= arr.Length) return null;
+                            return arr.GetValue(i);
+                        }
+
+                        if (recv is IList list)
+                        {
+                            int i = (int)Rt.ToNumber(idx);
+                            if (i < 0 || i >= list.Count) return null;
+                            return list[i];
+                        }
+
+                        if (recv is IDictionary dict)
+                        {
+                            return dict.Contains(idx) ? dict[idx] : null;
+                        }
+
+                        throw new Exception("TypeError: index access on non-array/object");
                     }
 
                 case NodeType.Call:
@@ -2584,78 +2609,70 @@ namespace MiniJs
                         var args = new List<object?>();
                         foreach (var a in argsNode.Kids) args.Add(Eval(a!, env));
 
-                        if (fnv is Function fn) return CallFunction(fn, args, thisVal);
-                        if (fnv is ClrCallable cc) return InvokeClrCallable(cc, args);
-                        if (fnv is Delegate del) return del.DynamicInvoke(args.ToArray());
+                        if (fnv is Function fn)
+                            return CallFunction(fn, args, thisVal);
+
+                        if (fnv is Delegate del)
+                            return del.DynamicInvoke(args.ToArray());
+
+                        if (fnv is ClrCallable cc)
+                            return InvokeClrMethod(cc.Target, cc.Name, args);
 
                         throw new Exception("TypeError: call of non-function");
                     }
 
                 case NodeType.NewExpr:
                     {
-                        string firstIdent = n.Tok.Lexeme;
+                        // 1) if identifier resolves to script class or Type, use that
                         object? sym = null;
-                        bool hasSym = true;
-                        try { sym = env.Get(firstIdent); }
-                        catch { hasSym = false; }
-
-                        if (hasSym && sym is ClassDef sc)
-                        {
-                            var obj = new JsObject { Klass = sc };
-                            object thisVal = obj;
-
-                            if (sc.Fields.Count > 0)
-                            {
-                                lock (obj)
-                                {
-                                    foreach (var f in sc.Fields)
-                                    {
-                                        if (!obj.Props.ContainsKey(f.name)) obj.Order.Add(f.name);
-                                        obj.Props[f.name] = null;
-                                    }
-                                }
-
-                                var initEnv = new Env(sc.Closure);
-                                initEnv.Declare("this", thisVal);
-
-                                foreach (var f in sc.Fields)
-                                {
-                                    object? fv = null;
-                                    if (f.initExpr != null) fv = Eval(f.initExpr, initEnv);
-                                    lock (obj) obj.Props[f.name] = fv;
-                                }
-                            }
-
-                            var sargs = new List<object?>();
-                            foreach (var a in n.Kids[0]!.Kids) sargs.Add(Eval(a!, env));
-
-                            if (sc.Methods.TryGetValue("constructor", out var ctor))
-                                CallFunction(ctor, sargs, thisVal);
-
-                            return obj;
-                        }
-
-                        Type? t = null;
-
-                        if (hasSym && sym is Type st) t = st;
-
-                        if (t == null && hasSym && sym is ClrNamespace ns)
-                        {
-                            string full = n.Text;
-                            if (full == firstIdent) full = ns.Name;
-                            else if (full.StartsWith(firstIdent + ".", StringComparison.Ordinal))
-                                full = ns.Name + full.Substring(firstIdent.Length);
-
-                            t = ResolveClrType(full);
-                        }
-
-                        if (t == null) t = ResolveClrType(n.Text);
-                        if (t == null) throw new Exception($"TypeError: CLR type not found: {n.Text}");
+                        bool symExists = false;
+                        try { sym = env.Get(n.Tok.Lexeme); symExists = true; } catch { symExists = false; }
 
                         var args = new List<object?>();
                         foreach (var a in n.Kids[0]!.Kids) args.Add(Eval(a!, env));
 
-                        return CreateClrInstance(t, args);
+                        if (symExists)
+                        {
+                            if (sym is ClassDef clsSym)
+                                return NewScriptInstance(clsSym, args);
+
+                            if (sym is Type typeSym)
+                                return CreateClrInstance(typeSym, args);
+
+                            // NEW: namespace alias support: new WinForms.Form()
+                            if (sym is ClrNamespace nsSym)
+                            {
+                                // n.Text is like "WinForms.Form.SubType"
+                                string prefix = n.Tok.Lexeme;            // "WinForms"
+                                string suffix = "";
+
+                                if (n.Text.Length > prefix.Length)
+                                    suffix = n.Text.Substring(prefix.Length); // ".Form..."
+
+                                string clrName = nsSym.Name + suffix;    // "System.Windows.Forms" + ".Form"
+                                var _ty = ResolveClrType(clrName);
+                                if (_ty != null) return CreateClrInstance(_ty, args);
+
+                                throw new Exception($"TypeError: CLR type not found: {clrName}");
+                            }
+                        }
+
+                        // 2) resolve by n.Text
+                        string name = n.Text;
+                        // script class by name
+                        try
+                        {
+                            var v = env.Get(name);
+                            if (v is ClassDef cls) return NewScriptInstance(cls, args);
+                            if (v is Type ty2) return CreateClrInstance(ty2, args);
+                        }
+                        catch { }
+
+                        // CLR type by name
+                        var ty = ResolveClrType(name);
+                        if (ty != null) return CreateClrInstance(ty, args);
+
+                        throw new Exception($"TypeError: type/class not found: {name}");
                     }
 
                 case NodeType.Assign:
@@ -2681,9 +2698,95 @@ namespace MiniJs
                         return newVal;
                     }
 
+                case NodeType.TaskExpr:
+                    {
+                        // task <unary>  OR task { ... }
+                        var expr = n.Kids[0]!;
+                        var t = _taskMgr.Enqueue(() =>
+                        {
+                            try
+                            {
+                                // run in same interpreter, shared env (thread-safe Env)
+                                if (expr.Type == NodeType.TaskBlock)
+                                {
+                                    var benv = new Env(env);
+                                    object? last = null;
+                                    foreach (var st in expr.Kids) last = Exec(st!, benv);
+                                    return last;
+                                }
+                                return Eval(expr, env);
+                            }
+                            catch (ReturnSignal rs)
+                            {
+                                return rs.Value;
+                            }
+                        });
+
+                        return new JsTask(t);
+                    }
+
+                case NodeType.AwaitExpr:
+                    {
+                        var v = Eval(n.Kids[0]!, env);
+
+                        if (v is JsTask jt) return jt.Wait();
+
+                        if (v is Task task)
+                        {
+                            task.GetAwaiter().GetResult();
+                            var ttype = task.GetType();
+                            if (ttype.IsGenericType && ttype.GetGenericTypeDefinition() == typeof(Task<>))
+                            {
+                                var propRes = ttype.GetProperty("Result");
+                                return propRes?.GetValue(task);
+                            }
+                            return null;
+                        }
+
+                        return v;
+                    }
+
                 default:
                     throw new Exception("eval(): unexpected node type");
             }
+        }
+
+        private object? NewScriptInstance(ClassDef cls, List<object?> args)
+        {
+            var obj = new JsObject { Klass = cls };
+
+            // init fields (declare first)
+            lock (obj)
+            {
+                foreach (var f in cls.Fields)
+                {
+                    if (!obj.Props.ContainsKey(f.name)) obj.Order.Add(f.name);
+                    obj.Props[f.name] = null;
+                }
+            }
+
+            // run initializers in class closure
+            if (cls.Fields.Count > 0)
+            {
+                var initEnv = new Env(cls.Closure);
+                initEnv.Declare("this", obj);
+
+                lock (obj)
+                {
+                    foreach (var f in cls.Fields)
+                    {
+                        object? fv = null;
+                        if (f.initExpr != null) fv = Eval(f.initExpr, initEnv);
+                        obj.Props[f.name] = fv;
+                    }
+                }
+            }
+
+            // call constructor
+            if (cls.Methods.TryGetValue("constructor", out var ctor))
+                CallFunction(ctor, args, obj);
+
+            return obj;
         }
 
         public object? Exec(Node n, Env env)
@@ -2694,45 +2797,75 @@ namespace MiniJs
             {
                 case NodeType.ImportStmt:
                     {
-                        string alias = n.Tok.Lexeme;
+                        // import X.Y as Alias;
                         string full = n.Text;
-
-                        object? val = ResolveClrType(full);
-                        if (val == null) val = new ClrNamespace(full);
-
-                        env.Declare(alias, val);
-                        return val;
+                        Type? ty = ResolveClrType(full);
+                        if (ty != null) env.Declare(n.Tok.Lexeme, ty);
+                        else env.Declare(n.Tok.Lexeme, new ClrNamespace(full));
+                        return null;
                     }
 
                 case NodeType.TaskStmt:
                     {
-                        _ = StartTask(n.Kids[0]!, env);
-                        return null;
-                    }
-
-                case NodeType.AwaitStmt:
-                    {
-                        var v = Eval(n.Kids[0]!, env);
-                        _ = AwaitAny(v);
+                        // schedule and ignore
+                        _ = Eval(new Node(NodeType.TaskExpr, n.Tok) { Kids = { n.Kids[0] } }, env);
                         return null;
                     }
 
                 case NodeType.YieldStmt:
                     {
-                        YieldOnce();
+                        Thread.Sleep(1);
                         return null;
                     }
 
                 case NodeType.LockStmt:
                     {
-                        var lkExpr = n.Kids[0]!;
-                        var body = n.Kids[1]!;
-                        object? lkVal = Eval(lkExpr, env);
-                        object lkObj = GetLockObject(lkVal);
+                        var keyObj = Eval(n.Kids[0]!, env);
 
-                        Monitor.Enter(lkObj);
-                        try { return Exec(body, env); }
-                        finally { Monitor.Exit(lkObj); }
+                        object lockObj;
+                        if (keyObj == null)
+                            throw new Exception("TypeError: lock(expr) expr evaluated to null");
+
+                        if (keyObj is string s)
+                        {
+                            lock (_namedLocksGuard)
+                            {
+                                if (!_namedLocks.TryGetValue(s, out lockObj!))
+                                {
+                                    lockObj = new object();
+                                    _namedLocks[s] = lockObj;
+                                }
+                            }
+                        }
+                        else if (keyObj.GetType().IsValueType)
+                        {
+                            string k = "val:" + Rt.ToJsString(keyObj);
+                            lock (_namedLocksGuard)
+                            {
+                                if (!_namedLocks.TryGetValue(k, out lockObj!))
+                                {
+                                    lockObj = new object();
+                                    _namedLocks[k] = lockObj;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            lockObj = keyObj;
+                        }
+
+                        lock (lockObj)
+                        {
+                            return Exec(n.Kids[1]!, env);
+                        }
+                    }
+
+                case NodeType.AwaitStmt:
+                    {
+                        var v = Eval(n.Kids[0]!, env);
+                        if (v is JsTask jt) { jt.Wait(); return null; }
+                        if (v is Task task) { task.GetAwaiter().GetResult(); return null; }
+                        return null;
                     }
 
                 case NodeType.LetDecl:
@@ -2806,7 +2939,10 @@ namespace MiniJs
                     {
                         while (Rt.IsTruthy(Eval(n.Kids[0]!, env)))
                         {
-                            try { Exec(n.Kids[1]!, env); }
+                            try
+                            {
+                                Exec(n.Kids[1]!, env);
+                            }
                             catch (ContinueSignal) { }
                             catch (BreakSignal) { break; }
                         }
@@ -2831,11 +2967,12 @@ namespace MiniJs
                         while (true)
                         {
                             if (cond != null)
-                            {
                                 if (!Rt.IsTruthy(Eval(cond, loopEnv))) break;
-                            }
 
-                            try { Exec(body, loopEnv); }
+                            try
+                            {
+                                Exec(body, loopEnv);
+                            }
                             catch (ContinueSignal) { }
                             catch (BreakSignal) { break; }
 
@@ -2861,10 +2998,11 @@ namespace MiniJs
                         loopEnv.Declare(name1, null);
                         if (v2 != null) loopEnv.Declare(name2, null);
 
-                        if (itv is JsArray a)
+                        // script array
+                        if (itv is JsArray ja)
                         {
                             List<object?> snap;
-                            lock (a) snap = a.Items.ToList();
+                            lock (ja) snap = ja.Items.ToList();
 
                             for (int i = 0; i < snap.Count; i++)
                             {
@@ -2873,7 +3011,10 @@ namespace MiniJs
                                     loopEnv.Set(name1, (double)i);
                                     loopEnv.Set(name2, snap[i]);
                                 }
-                                else loopEnv.Set(name1, snap[i]);
+                                else
+                                {
+                                    loopEnv.Set(name1, snap[i]);
+                                }
 
                                 try { Exec(body, loopEnv); }
                                 catch (ContinueSignal) { continue; }
@@ -2882,14 +3023,15 @@ namespace MiniJs
                             return null;
                         }
 
-                        if (itv is JsObject o)
+                        // script object
+                        if (itv is JsObject jo)
                         {
                             List<string> keys;
                             Dictionary<string, object?> propsSnap;
-                            lock (o)
+                            lock (jo)
                             {
-                                keys = (o.Order.Count > 0 ? o.Order : o.Props.Keys.ToList()).ToList();
-                                propsSnap = new Dictionary<string, object?>(o.Props);
+                                keys = (jo.Order.Count > 0 ? jo.Order : jo.Props.Keys.ToList()).ToList();
+                                propsSnap = new Dictionary<string, object?>(jo.Props);
                             }
 
                             foreach (var k in keys)
@@ -2901,7 +3043,10 @@ namespace MiniJs
                                     loopEnv.Set(name1, k);
                                     loopEnv.Set(name2, vv);
                                 }
-                                else loopEnv.Set(name1, vv);
+                                else
+                                {
+                                    loopEnv.Set(name1, vv);
+                                }
 
                                 try { Exec(body, loopEnv); }
                                 catch (ContinueSignal) { continue; }
@@ -2910,23 +3055,27 @@ namespace MiniJs
                             return null;
                         }
 
+                        // CLR IEnumerable
                         if (itv is IEnumerable en)
                         {
-                            int i = 0;
+                            int idx = 0;
                             foreach (var item in en)
                             {
                                 if (v2 != null)
                                 {
-                                    loopEnv.Set(name1, (double)i);
+                                    loopEnv.Set(name1, (double)idx);
                                     loopEnv.Set(name2, item);
                                 }
-                                else loopEnv.Set(name1, item);
-
-                                i++;
+                                else
+                                {
+                                    loopEnv.Set(name1, item);
+                                }
 
                                 try { Exec(body, loopEnv); }
-                                catch (ContinueSignal) { continue; }
+                                catch (ContinueSignal) { idx++; continue; }
                                 catch (BreakSignal) { break; }
+
+                                idx++;
                             }
                             return null;
                         }
@@ -2962,18 +3111,35 @@ namespace MiniJs
                 }
                 catch { }
 
-                string code = args.Length >= 1 ? ReadFile(args[0]) : "print(\"MiniJs ready\");\n";
+                string code;
+
+                if (args.Length >= 1)
+                    code = ReadFile(args[0]);
+                else
+                    code = "print(\"MiniJs ready\");\n";
 
                 var lx = new Lexer(code);
                 var ps = new Parser(lx);
                 var ast = ps.ParseProgram();
+
+                // Debug AST (optional)
+                AstDump.Dump(ast);
 
                 var it = new Interpreter();
                 it.Eval(ast, it.Global);
             }
             catch (Exception e)
             {
-                Console.Error.WriteLine(e.Message);
+                Exception ex = e;
+
+                if (ex is TargetInvocationException tie && tie.InnerException != null)
+                    ex = tie.InnerException;
+
+                if (ex is AggregateException ae && ae.InnerExceptions.Count > 0)
+                    ex = ae.InnerExceptions[0];
+
+                Console.Error.WriteLine(ex.Message);
+                Console.Error.WriteLine(ex.StackTrace);
                 Environment.Exit(1);
             }
         }
