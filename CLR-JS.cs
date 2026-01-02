@@ -2509,12 +2509,30 @@ namespace MiniJs
                             return null;
                         }
 
+                        // script array
+                        if (recv is JsArray ja2)
+                        {
+                            if (prop == "length")
+                            {
+                                int len;
+                                lock (ja2) len = ja2.Items.Count;
+                                return (double)len;
+                            }
+                            return null;
+                        }
+
                         // script object
                         if (recv is JsObject jo)
                         {
                             lock (jo)
                             {
+                                // echte property gewinnt (falls user obj.length = 123 setzt)
                                 if (jo.Props.TryGetValue(prop, out var v)) return v;
+
+                                // fallback: length = Anzahl Properties
+                                if (prop == "length")
+                                    return (double)jo.Props.Count; // oder jo.Order.Count, je nachdem was du willst
+
                                 if (jo.Klass != null && jo.Klass.Methods.TryGetValue(prop, out var mfn))
                                     return mfn;
                             }
@@ -3123,7 +3141,7 @@ namespace MiniJs
                 var ast = ps.ParseProgram();
 
                 // Debug AST (optional)
-                AstDump.Dump(ast);
+                //AstDump.Dump(ast);
 
                 var it = new Interpreter();
                 it.Eval(ast, it.Global);
