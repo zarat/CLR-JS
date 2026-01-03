@@ -1,6 +1,4 @@
 // Program.cs - MiniJs: JS-like-ish interpreter with CLR interop + WinForms helpers + tasks
-// Build: dotnet build
-// Run:   dotnet run -- [file]
 
 using System;
 using System.IO;
@@ -16,6 +14,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.ComponentModel;
 using System.Windows.Forms;
+using System.Runtime.Loader;
 
 namespace MiniJs
 {
@@ -1464,10 +1463,14 @@ namespace MiniJs
 
         private readonly Dictionary<string, Type?> _typeCache = new(StringComparer.Ordinal);
 
+        private readonly string[] _tpa;
+        private readonly Dictionary<string, Assembly> _asmByPath = new(StringComparer.OrdinalIgnoreCase);
+
         public Interpreter()
         {
             Global = new Env();
             _taskMgr = new TaskManager(Math.Max(1, Environment.ProcessorCount), 5000);
+            _tpa = ((string?)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES"))?.Split(Path.PathSeparator) ?? Array.Empty<string>();
 
             // builtin print(...)
             var pf = new Function
@@ -1497,8 +1500,8 @@ namespace MiniJs
                 }
             };
             Global.Declare("read", rf);
-            
-            // builtin read(...)
+
+            // builtin readfile(...)
             var rfile = new Function
             {
                 IsNative = true,
@@ -1653,34 +1656,55 @@ namespace MiniJs
         private Type? ResolveClrType(string fullName)
         {
             lock (_typeCache)
-            {
-                if (_typeCache.TryGetValue(fullName, out var cached)) return cached;
-            }
+                if (_typeCache.TryGetValue(fullName, out var cached) && cached != null)
+                    return cached;
 
             Type? found = null;
+
+            // 1) already loaded
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
-                found = asm.GetType(fullName, throwOnError: false, ignoreCase: false);
-                if (found != null) break;
+                found = asm.GetType(fullName, false, false);
+                if (found != null) goto FOUND;
             }
 
-            // small helper: allow "System.Collections.Generic.List" -> List`1<object>
-            if (found == null)
+            // 2) try load likely framework assemblies from TPA list
+            // build prefixes: "System.Security.Cryptography.Aes" -> try "System.Security.Cryptography", "System.Security"
+            string ns = fullName;
+            int lastDot = ns.LastIndexOf('.');
+            if (lastDot > 0) ns = ns.Substring(0, lastDot);
+
+            var parts = ns.Split('.');
+            var prefixes = new List<string>();
+            for (int i = Math.Min(parts.Length, 4); i >= 1; i--)
+                prefixes.Add(string.Join(".", parts.Take(i)));
+
+            foreach (var prefix in prefixes)
             {
-                string gen1 = fullName + "`1";
-                Type? gdef = null;
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                foreach (var path in _tpa)
                 {
-                    gdef = asm.GetType(gen1, false, false);
-                    if (gdef != null) break;
-                }
-                if (gdef != null && gdef.IsGenericTypeDefinition && gdef.GetGenericArguments().Length == 1)
-                {
-                    try { found = gdef.MakeGenericType(typeof(object)); } catch { }
+                    var file = Path.GetFileNameWithoutExtension(path);
+                    if (!file.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+
+                    if (!_asmByPath.TryGetValue(path, out var a))
+                    {
+                        try
+                        {
+                            a = AssemblyLoadContext.Default.LoadFromAssemblyPath(path);
+                            _asmByPath[path] = a;
+                        }
+                        catch { continue; }
+                    }
+
+                    found = a.GetType(fullName, false, false);
+                    if (found != null) goto FOUND;
                 }
             }
 
-            lock (_typeCache) _typeCache[fullName] = found;
+        FOUND:
+            if (found != null)
+                lock (_typeCache) _typeCache[fullName] = found;
+
             return found;
         }
 
@@ -2319,6 +2343,7 @@ namespace MiniJs
             return Rt.ToNumber(l) + Rt.ToNumber(r);
         }
 
+        /*
         private static bool StrictEq(object? a, object? b)
         {
             if (a == null && b == null) return true;
@@ -2330,6 +2355,27 @@ namespace MiniJs
             if (a.GetType() != b.GetType()) return false;
 
             // for reference types, keep JS-ish strictness by reference equality
+            if (!a.GetType().IsValueType)
+                return ReferenceEquals(a, b);
+
+            return a.Equals(b);
+        }
+        */
+        private static bool StrictEq(object? a, object? b)
+        {
+            if (a == null && b == null) return true;
+            if (a == null || b == null) return false;
+
+            // ✅ FIX: strings immer nach INHALT vergleichen (nicht ReferenceEquals)
+            if (a is string sa && b is string sb)
+                return string.Equals(sa, sb, StringComparison.Ordinal);
+
+            if (Rt.IsNumeric(a) && Rt.IsNumeric(b))
+                return Rt.ToNumber(a) == Rt.ToNumber(b);
+
+            if (a.GetType() != b.GetType()) return false;
+
+            // für andere reference types weiter "strict" per Referenz
             if (!a.GetType().IsValueType)
                 return ReferenceEquals(a, b);
 
@@ -2661,7 +2707,18 @@ namespace MiniJs
                         if (fnv is ClrCallable cc)
                             return InvokeClrMethod(cc.Target, cc.Name, args);
 
-                        throw new Exception("TypeError: call of non-function");
+                        string calleeShape =
+                            calleeNode.Type == NodeType.Var ? $"var '{calleeNode.Tok.Lexeme}'" :
+                            calleeNode.Type == NodeType.Member ? $"member '.{calleeNode.Kids[1]!.Tok.Lexeme}'" :
+                            calleeNode.Type == NodeType.Index ? "index '[..]'" :
+                            calleeNode.Type.ToString();
+
+                        string gotType = fnv == null ? "null" : fnv.GetType().FullName ?? "(no type)";
+                        string gotVal = Rt.ToJsString(fnv);
+
+                        throw new Exception(
+                            $"TypeError: call of non-function at pos {n.Tok.Pos} (callee={calleeShape}) -> {gotType} value={gotVal}"
+                        );
                     }
 
                 case NodeType.NewExpr:
