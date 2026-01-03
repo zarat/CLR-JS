@@ -1486,6 +1486,31 @@ namespace MiniJs
             };
             Global.Declare("print", pf);
 
+            // builtin read(...)
+            var rf = new Function
+            {
+                IsNative = true,
+                Native = (args, _) =>
+                {
+                    string str = Console.ReadLine();
+                    return str;
+                }
+            };
+            Global.Declare("read", rf);
+            
+            // builtin read(...)
+            var rfile = new Function
+            {
+                IsNative = true,
+                Native = (args, _) =>
+                {
+                    string script = args[0].ToString();
+                    string str = File.ReadAllText(script);
+                    return str;
+                }
+            };
+            Global.Declare("readfile", rfile);
+
             // root namespace
             Global.Declare("System", new ClrNamespace("System"));
 
