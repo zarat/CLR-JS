@@ -1466,6 +1466,10 @@ namespace MiniJs
         private readonly string[] _tpa;
         private readonly Dictionary<string, Assembly> _asmByPath = new(StringComparer.OrdinalIgnoreCase);
 
+        private static readonly object _asmResolveLock = new();
+        private static bool _asmResolverInstalled = false;
+        private static readonly HashSet<string> _probeDirs = new(StringComparer.OrdinalIgnoreCase);
+
         public Interpreter()
         {
             Global = new Env();
@@ -1513,6 +1517,54 @@ namespace MiniJs
                 }
             };
             Global.Declare("readfile", rfile);
+
+            EnsureAsmResolverInstalled();
+
+            Global.Declare("loadDll", new Function
+            {
+                IsNative = true,
+                Native = (args, _) =>
+                {
+                    if (args.Count < 1) throw new Exception("TypeError: loadDll(path) expects 1 arg");
+
+                    var input = Rt.ToJsString(args[0]).Trim();
+                    if (string.IsNullOrWhiteSpace(input))
+                        throw new Exception("TypeError: loadDll(path) expects a non-empty path");
+
+                    string fullPath;
+
+                    // wenn nur "CsvHelper" übergeben wird -> "CsvHelper.dll" suchen
+                    if (!input.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                        input += ".dll";
+
+                    // relativ: erst CWD, dann EXE-Ordner
+                    if (Path.IsPathRooted(input))
+                    {
+                        fullPath = Path.GetFullPath(input);
+                    }
+                    else
+                    {
+                        var cand1 = Path.GetFullPath(Path.Combine(Environment.CurrentDirectory, input));
+                        var cand2 = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, input));
+                        fullPath = File.Exists(cand1) ? cand1 : cand2;
+                    }
+
+                    if (!File.Exists(fullPath))
+                        throw new Exception("File not found: " + fullPath);
+
+                    // Probe-Dir merken (für Dependencies)
+                    AddProbeDir(Path.GetDirectoryName(fullPath)!);
+
+                    // Laden
+                    if (!_asmByPath.TryGetValue(fullPath, out var asm))
+                    {
+                        asm = AssemblyLoadContext.Default.LoadFromAssemblyPath(fullPath);
+                        _asmByPath[fullPath] = asm;
+                    }
+
+                    return asm.FullName ?? asm.GetName().Name ?? "loaded";
+                }
+            });
 
             // root namespace
             Global.Declare("System", new ClrNamespace("System"));
@@ -1652,6 +1704,42 @@ namespace MiniJs
         }
 
         // ---------------- CLR type resolution ----------------
+
+        private static void AddProbeDir(string dir)
+        {
+            if (string.IsNullOrWhiteSpace(dir)) return;
+            dir = Path.GetFullPath(dir);
+            lock (_asmResolveLock) _probeDirs.Add(dir);
+        }
+
+        private static void EnsureAsmResolverInstalled()
+        {
+            lock (_asmResolveLock)
+            {
+                if (_asmResolverInstalled) return;
+
+                // Standard-Probe: EXE-Ordner + aktuelles Working Directory
+                AddProbeDir(AppContext.BaseDirectory);
+                AddProbeDir(Environment.CurrentDirectory);
+
+                AssemblyLoadContext.Default.Resolving += (ctx, asmName) =>
+                {
+                    var file = (asmName.Name ?? "") + ".dll";
+                    string[] dirs;
+                    lock (_asmResolveLock) dirs = _probeDirs.ToArray();
+
+                    foreach (var d in dirs)
+                    {
+                        var cand = Path.Combine(d, file);
+                        if (File.Exists(cand))
+                            return ctx.LoadFromAssemblyPath(Path.GetFullPath(cand));
+                    }
+                    return null;
+                };
+
+                _asmResolverInstalled = true;
+            }
+        }
 
         private Type? ResolveClrType(string fullName)
         {
